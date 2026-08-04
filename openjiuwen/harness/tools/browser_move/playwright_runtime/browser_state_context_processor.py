@@ -76,28 +76,18 @@ class BrowserStateContextProcessor(ContextProcessor):
         **kwargs: Any,
     ) -> tuple[ContextEvent | None, ContextWindow]:
         del kwargs
-        source_messages = (
-            context.get_messages()
-            if context is not None
-            else context_window.context_messages
-        )
+        source_messages = context.get_messages() if context is not None else context_window.context_messages
         refresh_tool_call_ids = self._completed_refresh_tool_call_ids(source_messages)
-        should_refresh = (
-            self._cached_state is None
-            or bool(refresh_tool_call_ids - self._seen_refresh_tool_call_ids)
-        )
+        should_refresh = self._cached_state is None or bool(refresh_tool_call_ids - self._seen_refresh_tool_call_ids)
         if should_refresh:
             self._cached_state = await self._capture_state()
         self._seen_refresh_tool_call_ids.update(refresh_tool_call_ids)
 
-        assert self._cached_state is not None
-        state = self._cached_state
+        state = self._cached_state if self._cached_state is not None else {}
         current_message = self._build_state_message(state)
 
         context_window.context_messages = [
-            message
-            for message in context_window.context_messages
-            if not self._is_browser_state_message(message)
+            message for message in context_window.context_messages if not self._is_browser_state_message(message)
         ]
         context_window.context_messages.append(current_message)
         return None, context_window
@@ -120,19 +110,14 @@ class BrowserStateContextProcessor(ContextProcessor):
                 continue
             for tool_call in message.tool_calls or []:
                 call_id = str(tool_call.id) if tool_call.id else ""
-                if (
-                    call_id in completed_call_ids
-                    and cls._is_refresh_tool_name(tool_call.name)
-                ):
+                if call_id in completed_call_ids and cls._is_refresh_tool_name(tool_call.name):
                     refresh_tool_call_ids.add(call_id)
         return refresh_tool_call_ids
 
     @staticmethod
     def _is_refresh_tool_name(tool_name: str) -> bool:
         return any(
-            tool_name == expected
-            or tool_name.endswith(f".{expected}")
-            or tool_name.endswith(f"_{expected}")
+            tool_name == expected or tool_name.endswith(f".{expected}") or tool_name.endswith(f"_{expected}")
             for expected in _BROWSER_STATE_REFRESH_TOOL_NAMES
         )
 
@@ -205,10 +190,7 @@ class BrowserStateContextProcessor(ContextProcessor):
 
     @staticmethod
     def _is_browser_state_message(message: BaseMessage) -> bool:
-        return (
-            message.name == _BROWSER_STATE_MESSAGE_NAME
-            or bool(message.metadata.get(_BROWSER_STATE_METADATA_KEY))
-        )
+        return message.name == _BROWSER_STATE_MESSAGE_NAME or bool(message.metadata.get(_BROWSER_STATE_METADATA_KEY))
 
     def load_state(self, state: Dict[str, Any]) -> None:
         del state

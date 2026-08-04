@@ -768,10 +768,14 @@ def test_checkpointed_state_is_restored_by_a_reconstructed_agent_session() -> No
         {"task": "Track it", "status": "pending"},
     ]
     assert len(restored.recent_steps) == 1
-    prompt = _inject(
-        BrowserWorkingContextProcessor(config),
-        second_context,
-    ).context_messages[-1].content
+    prompt = (
+        _inject(
+            BrowserWorkingContextProcessor(config),
+            second_context,
+        )
+        .context_messages[-1]
+        .content
+    )
     assert '"kind": "follow_up"' in prompt
     assert "Order 123 was found." in prompt
     assert '"recent_durable_steps": [' in prompt

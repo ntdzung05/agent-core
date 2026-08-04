@@ -176,10 +176,7 @@ class BrowserWorkingContextRail(AgentRail):
             return None, "Model browser context update must be a JSON object."
         missing_fields = sorted(_REQUIRED_MEMORY_FIELDS.difference(parsed))
         if missing_fields:
-            return None, (
-                "Model browser context update omitted required fields: "
-                f"{', '.join(missing_fields)}."
-            )
+            return None, (f"Model browser context update omitted required fields: {', '.join(missing_fields)}.")
         try:
             memory = BrowserWorkingMemory.model_validate(parsed)
         except ValidationError as exc:

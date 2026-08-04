@@ -41,7 +41,7 @@ def _state(url: str) -> dict:
             "pixels_above": 400,
             "pixels_below": 1280,
         },
-        "dom": "- button \"Continue\" [ref=e7]",
+        "dom": '- button "Continue" [ref=e7]',
     }
 
 
@@ -49,9 +49,7 @@ def _state(url: str) -> dict:
 async def test_processor_reuses_cached_browser_state_without_navigation() -> None:
     provider = AsyncMock()
     provider.capture_browser_state.return_value = _state("https://first.example")
-    processor = BrowserStateContextProcessor(
-        BrowserStateContextProcessorConfig(provider=provider)
-    )
+    processor = BrowserStateContextProcessor(BrowserStateContextProcessorConfig(provider=provider))
     window = ContextWindow(context_messages=[UserMessage(content="original request")])
 
     _, window = await processor.on_get_context_window(None, window)
@@ -67,7 +65,7 @@ async def test_processor_reuses_cached_browser_state_without_navigation() -> Non
     assert "https://first.example" in state_message.content
     assert "https://other.example" in state_message.content
     assert '"scroll_y": 400' in state_message.content
-    assert '[ref=e7]' in state_message.content
+    assert "[ref=e7]" in state_message.content
     assert "image_url" not in state_message.content
     provider.capture_browser_state.assert_awaited_with()
 
@@ -137,10 +135,7 @@ async def test_context_engine_refreshes_state_after_completed_mutating_tool(
     persisted_messages = context.get_messages()
     assert len(persisted_messages) == 3
     assert persisted_messages[0].content == "original request"
-    assert all(
-        not message.metadata.get("browser_state_context")
-        for message in persisted_messages
-    )
+    assert all(not message.metadata.get("browser_state_context") for message in persisted_messages)
     assert "https://first.example" in first_window.context_messages[-1].content
     assert "https://first.example" in cached_window.context_messages[-1].content
     assert "https://first.example" in pending_window.context_messages[-1].content
@@ -193,9 +188,7 @@ async def test_context_engine_does_not_refresh_after_read_only_browser_tool() ->
 async def test_processor_injects_explicit_unavailable_state_without_stale_image() -> None:
     provider = AsyncMock()
     provider.capture_browser_state.side_effect = RuntimeError("browser disconnected")
-    processor = BrowserStateContextProcessor(
-        BrowserStateContextProcessorConfig(provider=provider)
-    )
+    processor = BrowserStateContextProcessor(BrowserStateContextProcessorConfig(provider=provider))
     stale = UserMessage(
         name="current_browser_state",
         metadata={"browser_state_context": True},
@@ -222,7 +215,7 @@ async def test_processor_injects_explicit_unavailable_state_without_stale_image(
 async def test_runtime_combines_snapshot_with_page_metadata() -> None:
     runtime = object.__new__(BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._call_playwright_tool = AsyncMock(return_value="- link \"Docs\" [ref=e3]")
+    runtime._call_playwright_tool = AsyncMock(return_value='- link "Docs" [ref=e3]')
     runtime._call_playwright_run_code_unsafe = AsyncMock(
         return_value={
             "ok": True,

@@ -185,7 +185,8 @@ class BrowserWorkingContextStore:
     def __init__(self, config: BrowserWorkingContextConfig) -> None:
         self.config = config
 
-    def load(self, session: Any) -> BrowserWorkingContextState:
+    @staticmethod
+    def load(session: Any) -> BrowserWorkingContextState:
         if session is None:
             return BrowserWorkingContextState()
         raw_state = session.get_state(BROWSER_WORKING_CONTEXT_STATE_KEY)
@@ -194,9 +195,7 @@ class BrowserWorkingContextStore:
         try:
             return BrowserWorkingContextState.model_validate(raw_state)
         except ValidationError:
-            browser_agent_log_warning(
-                "[BrowserWorkingContext] invalid stored state; starting with an empty state"
-            )
+            browser_agent_log_warning("[BrowserWorkingContext] invalid stored state; starting with an empty state")
             return BrowserWorkingContextState()
 
     @staticmethod
@@ -222,8 +221,7 @@ class BrowserWorkingContextStore:
         self._reconcile_request_task(state, request_text)
         self.save(session, state)
         browser_agent_log_info(
-            "[BrowserWorkingContext] began %s request %d for session %s "
-            "(tasks=%d, durable_steps=%d)",
+            "[BrowserWorkingContext] began %s request %d for session %s (tasks=%d, durable_steps=%d)",
             state.request_kind,
             state.request_sequence,
             getattr(session, "get_session_id", lambda: "")(),
@@ -452,7 +450,22 @@ class BrowserWorkingContextStore:
         body = _bounded_text(body, self.config.max_prompt_chars)
         return f"<browser_working_context>\n{instructions}\n{body}\n</browser_working_context>"
 
-    def _sanitize_list(self, va…136 tokens truncated… and ensure the active request is actionable."""
+    def _sanitize_list(self, values: Iterable[Any]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in list(values)[: self.config.max_list_items]:
+            text = _bounded_text(value, self.config.max_item_chars)
+            if text and text not in seen:
+                seen.add(text)
+                result.append(text)
+        return result
+
+    def _reconcile_request_task(
+        self,
+        state: BrowserWorkingContextState,
+        request_text: str,
+    ) -> None:
+        """Preserve restored work and ensure the active request is actionable."""
 
         tasks = list(state.current.task_list)
         if any(item.task == request_text for item in tasks):
@@ -514,7 +527,7 @@ class BrowserWorkingContextStore:
 
     def _limit_history(self, state: BrowserWorkingContextState) -> None:
         if len(state.recent_steps) > self.config.max_recent_steps:
-            state.recent_steps = state.recent_steps[-self.config.max_recent_steps :]
+            state.recent_steps = state.recent_steps[-self.config.max_recent_steps:]
 
     def _infer_tool_error(self, content: Any) -> Optional[str]:
         text = self._message_content_to_text(content)
@@ -526,11 +539,16 @@ class BrowserWorkingContextStore:
 
         try:
             parsed = json.loads(text)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError):
             parsed = None
         if isinstance(parsed, dict):
             error = parsed.get("error")
-            if error and (parsed.get("success") is False or parsed.get("ok") is False or parsed.get("isError") is True):
+            failure_markers = (
+                parsed.get("success") is False,
+                parsed.get("ok") is False,
+                parsed.get("isError") is True,
+            )
+            if error and any(failure_markers):
                 return _bounded_text(error, self.config.max_item_chars)
 
         if "success=false" in lowered and "error=" in lowered:
