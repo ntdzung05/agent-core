@@ -20,6 +20,15 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
+    BrowserStateContextProcessorConfig,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
+    BrowserWorkingContextProcessorConfig,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+    BrowserWorkingContextRail,
+)
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
@@ -53,6 +62,10 @@ if TYPE_CHECKING:
 
 
 BROWSER_AGENT_FACTORY_NAME = "browser_agent"
+# Agent checkpoints are namespaced by AgentCard.id inside a conversation.
+# Keep the default stable so reconstructing this subagent can restore its
+# Session-backed working context on a same-conversation follow-up.
+BROWSER_AGENT_CARD_ID = "openjiuwen.browser_agent"
 DEFAULT_BROWSER_AGENT_TEMPERATURE = 0.4
 DEFAULT_BROWSER_AGENT_MAX_ITERATIONS = 100
 _BROWSER_MODEL_TEMPERATURE_MARKER = "_browser_agent_temperature"
@@ -299,6 +312,7 @@ def build_browser_agent_config(
     return SubAgentConfig(
         agent_card=card
         or AgentCard(
+            id=BROWSER_AGENT_CARD_ID,
             name="browser_agent",
             description=DEFAULT_BROWSER_AGENT_DESCRIPTION.get(
                 resolved_language,
@@ -382,6 +396,7 @@ def create_browser_agent(
     resolved_settings = _resolve_runtime_settings(browser_model, settings, instance)
 
     final_card = card or AgentCard(
+        id=BROWSER_AGENT_CARD_ID,
         name="browser_agent",
         description=DEFAULT_BROWSER_AGENT_DESCRIPTION.get(
             resolved_language,
@@ -405,15 +420,34 @@ def create_browser_agent(
     }
     browser_backend = BrowserAgentRuntime(**runtime_kwargs)
     injected_tools = build_browser_runtime_tools(browser_backend, language=resolved_language)
+    working_context_config = BrowserWorkingContextProcessorConfig(
+        language=resolved_language,
+    )
+    injected_rails: List[AgentRail] = [
+        BrowserRuntimeRail(browser_backend),
+        BrowserWorkingContextRail(working_context_config),
+    ]
     injected_tools.append(BrowserOffloadRecallTool(workspace, language=resolved_language))
-    injected_rails: List[AgentRail] = [BrowserRuntimeRail(browser_backend)]
 
-    # Window the large browser probe/snapshot results unless the caller already
-    # manages context processors via their own ContextProcessorRail.
-    # Browser probe/snapshot tools emit large results; keep only the most recent
-    # few in context and persist older ones via ToolResultWindowProcessor.
+    browser_state_processor = (
+        "BrowserStateContextProcessor",
+        BrowserStateContextProcessorConfig(provider=browser_backend),
+    )
+    browser_working_context_processor = (
+        "BrowserWorkingContextProcessor",
+        working_context_config,
+    )
     browser_windowed_tool_names = ["browser_probe_interactives", "browser_probe_cards", "browser_snapshot"]
-    if not any(isinstance(rail, ContextProcessorRail) for rail in (rails or [])):
+    caller_context_rails = [rail for rail in (rails or []) if isinstance(rail, ContextProcessorRail)]
+    if caller_context_rails:
+        for context_rail in caller_context_rails:
+            context_rail.add_processors(
+                [
+                    browser_working_context_processor,
+                    browser_state_processor,
+                ]
+            )
+    else:
         injected_rails.append(
             ContextProcessorRail(
                 processors=[
@@ -426,7 +460,9 @@ def create_browser_agent(
                             min_offload_chars=4096,
                             small_result_trim_size=800,
                         ),
-                    )
+                    ),
+                    browser_working_context_processor,
+                    browser_state_processor,
                 ],
                 preset=False,
             )
@@ -462,6 +498,7 @@ def create_browser_agent(
 
 
 __all__ = [
+    "BROWSER_AGENT_CARD_ID",
     "BROWSER_AGENT_FACTORY_NAME",
     "DEFAULT_BROWSER_AGENT_MAX_ITERATIONS",
     "DEFAULT_BROWSER_AGENT_TEMPERATURE",

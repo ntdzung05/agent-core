@@ -888,6 +888,7 @@ class DeepAgent(BaseAgent):
             )
 
         inner_card = AgentCard(
+            id=self.card.id,
             name=f"{self.card.name}_react",
             description=self.card.description or "",
         )
