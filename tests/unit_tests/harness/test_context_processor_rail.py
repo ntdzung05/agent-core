@@ -728,6 +728,28 @@ def test_build_preset_processors_propagates_context_debug_to_session_memory():
     assert compressor_cfg.memory.debug_dump_dir == "/tmp/context-debug"
 
 
+def test_context_processor_rail_add_processors_appends_and_replaces_by_key():
+    first = DialogueCompressorConfig(messages_threshold=20)
+    replacement = DialogueCompressorConfig(messages_threshold=30)
+    extra = DialogueCompressorConfig(messages_threshold=40)
+    rail = ContextProcessorRail(
+        preset=False,
+        processors=[("Existing", first)],
+    )
+
+    rail.add_processors(
+        [
+            ("Existing", replacement),
+            ("Additional", extra),
+        ]
+    )
+
+    assert rail._user_processors == [
+        ("Existing", replacement),
+        ("Additional", extra),
+    ]
+
+
 # =============================================================================
 # ContextProcessorRail - init/uninit Tests
 # =============================================================================

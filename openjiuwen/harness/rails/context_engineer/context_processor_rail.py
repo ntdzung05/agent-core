@@ -125,11 +125,34 @@ class ContextProcessorRail(DeepAgentRail):
         self._all_processors: List[Tuple[str, BaseModel]] = []
         self._reload_enabled = False
         self._recall_enabled = False
+        self._initialized = False
         # Abilities this rail actually registered, mapped from tool name to the
         # exact card that was stored. The name is the ability-manager key, while
         # the card identity tells uninit whether this rail is still the owner or
         # another rail has since taken the name over.
         self._owned_tool_cards: Dict[str, ToolCard] = {}
+
+    def add_processors(
+        self,
+        processors: Union[
+            Tuple[str, BaseModel],
+            Tuple[str, Dict],
+            List[Tuple[str, BaseModel]],
+            List[Tuple[str, Dict]],
+        ],
+    ) -> None:
+        """Add or replace processor configs before the rail is initialized."""
+        if self._initialized:
+            raise RuntimeError("Cannot add context processors after ContextProcessorRail.init()")
+
+        additions = [processors] if isinstance(processors, tuple) else list(processors)
+        for processor_key, processor_config in additions:
+            for index, (existing_key, _) in enumerate(self._user_processors):
+                if existing_key == processor_key:
+                    self._user_processors[index] = (processor_key, processor_config)
+                    break
+            else:
+                self._user_processors.append((processor_key, processor_config))
 
     @staticmethod
     def _merge_config_with_overrides(
@@ -264,6 +287,7 @@ class ContextProcessorRail(DeepAgentRail):
 
     def init(self, agent) -> None:
         """Inject / merge processors into agent.react_agent._config.context_processors."""
+        self._initialized = True
         config = getattr(getattr(agent, "react_agent", None), "_config", None)
         if config is None:
             return
@@ -413,6 +437,7 @@ class ContextProcessorRail(DeepAgentRail):
         self._all_processors = []
         self._reload_enabled = False
         self._recall_enabled = False
+        self._initialized = False
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         self._reset_loop_bailout_counter(ctx)
