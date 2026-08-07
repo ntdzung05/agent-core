@@ -175,10 +175,17 @@ def test_browser_agent_prompt_enforces_convergent_browser_strategy() -> None:
     assert "observable condition waits" in english
     assert "navigate directly to that URL" in english
     assert "Stop immediately" in english
+    assert "Every model call includes the latest complete <browser_state> observation" in english
+    assert "A fresh browser capture occurs initially" in english
+    assert "page_change=unchanged" in english
+    assert "<required_next_action>" in english
     assert "直接构造搜索结果 URL" in chinese
     assert "可观察条件" in chinese
     assert "直接导航该 URL" in chinese
     assert "立即结束" in chinese
+    assert "<browser_state_progress>" in chinese
+    assert "page_change=unchanged" in chinese
+    assert "<required_next_action>" in chinese
     assert "browser_run_code_unsafe" not in english
     assert "browser_run_code_unsafe" not in chinese
     assert "makes a browser_run_code tool visible" in english

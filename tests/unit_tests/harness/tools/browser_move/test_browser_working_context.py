@@ -26,6 +26,8 @@ from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
     BROWSER_TOOL_MEMORY_METADATA_KEY,
+    BROWSER_WORKING_MEMORY_RECORD_BEGIN,
+    BROWSER_WORKING_MEMORY_RECORD_END,
     BrowserWorkingContextStore,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
@@ -89,7 +91,10 @@ def _response(
     tool_calls: list[ToolCall] | None = None,
     visible_text: str = "",
 ) -> AssistantMessage:
-    content = f"{visible_text}\n<browser_context_update>{json.dumps(memory)}</browser_context_update>"
+    content = (
+        f"{visible_text}\n{BROWSER_WORKING_MEMORY_RECORD_BEGIN}\n"
+        f"{json.dumps(memory)}\n{BROWSER_WORKING_MEMORY_RECORD_END}"
+    )
     return AssistantMessage(content=content, tool_calls=tool_calls)
 
 
@@ -199,8 +204,43 @@ def test_missing_model_update_does_not_erase_last_valid_state() -> None:
     assert state.current.task_list[0].task == "Keep this confirmed task"
     assert state.current.task_list[0].status == "completed"
     assert state.recent_steps[-1].model_memory == state.current
-    assert state.recent_steps[-1].model_update_error == ("Model omitted the required browser context update.")
+    assert state.recent_steps[-1].model_update_error == ("Model omitted the required working-memory record.")
     assert missing_update.content == "Visible answer without internal state"
+
+
+def test_tool_call_without_record_carries_memory_forward_without_an_error() -> None:
+    config = BrowserWorkingContextProcessorConfig()
+    rail = BrowserWorkingContextRail(config)
+    session = _FakeSession()
+    context = _FakeContext(session)
+    _run(
+        rail.before_invoke(
+            AgentCallbackContext(
+                agent=None,
+                inputs=InvokeInputs(query="Inspect the checkout flow"),
+                session=session,
+            )
+        )
+    )
+    tool_call = _tool_call("call-1", "browser_navigate")
+    response = AssistantMessage(content="", tool_calls=[tool_call])
+    model_ctx = _model_ctx(rail, session, context, response)
+
+    _run(rail.after_model_call(model_ctx))
+
+    pending_state = BrowserWorkingContextStore(config).load(session)
+    assert pending_state.pending_step is not None
+    assert pending_state.pending_step.model_update_error is None
+    assert pending_state.pending_step.model_memory == pending_state.current
+    assert response.content == ""
+
+    context.messages.append(ToolMessage(content="navigation complete", tool_call_id="call-1"))
+    _run(rail.after_react_iteration(model_ctx))
+
+    committed_state = BrowserWorkingContextStore(config).load(session)
+    assert committed_state.pending_step is None
+    assert committed_state.recent_steps[-1].model_update_error is None
+    assert committed_state.current.task_list[0].task == "Inspect the checkout flow"
 
 
 def test_rail_enforces_fallback_update_when_model_omits_block() -> None:
@@ -226,7 +266,7 @@ def test_rail_enforces_fallback_update_when_model_omits_block() -> None:
         {"task": "Inspect the checkout flow", "status": "pending"},
     ]
     assert state.recent_steps[-1].model_memory == state.current
-    assert state.recent_steps[-1].model_update_error == "Model omitted the required browser context update."
+    assert state.recent_steps[-1].model_update_error == "Model omitted the required working-memory record."
     assert response.content == "Inspecting checkout now."
 
 
@@ -235,10 +275,14 @@ def test_rail_rejects_incomplete_update_and_enforces_complete_fallback() -> None
     rail = BrowserWorkingContextRail(config)
     session = _FakeSession()
     context = _FakeContext(session)
+    incomplete_record = {
+        "task_list": [{"task": "Inspect checkout", "status": "pending"}],
+    }
     response = AssistantMessage(
         content=(
-            '<browser_context_update>{"task_list": '
-            '[{"task": "Inspect checkout", "status": "pending"}]}</browser_context_update>'
+            f"{BROWSER_WORKING_MEMORY_RECORD_BEGIN}\n"
+            f"{json.dumps(incomplete_record)}\n"
+            f"{BROWSER_WORKING_MEMORY_RECORD_END}"
         )
     )
     model_ctx = AgentCallbackContext(
@@ -256,7 +300,7 @@ def test_rail_rejects_incomplete_update_and_enforces_complete_fallback() -> None
     state = BrowserWorkingContextStore(config).load(session)
     assert state.current.model_dump() == _memory("Inspect checkout")
     assert state.recent_steps[-1].model_update_error == (
-        "Model browser context update omitted required fields: "
+        "Model working-memory record omitted required fields: "
         "blockers, errors, failures, important_information, key_facts."
     )
     assert response.content == ""
@@ -498,6 +542,12 @@ def test_processor_guidance_defines_each_working_memory_field() -> None:
     assert "important_information: other durable operational context" in prompt
     assert "Use an empty list [] when a field has no relevant entries" in prompt
     assert "Do not invent facts or mark a task completed without evidence" in prompt
+    assert "This record is plain assistant text for framework bookkeeping" in prompt
+    assert "not a tool, function, or ability" in prompt
+    assert "Never place it in tool_calls" in prompt
+    assert BROWSER_WORKING_MEMORY_RECORD_BEGIN in prompt
+    assert BROWSER_WORKING_MEMORY_RECORD_END in prompt
+    assert "<browser_context_update>" not in prompt
 
 
 def test_processor_renders_chinese_guidance_with_stable_schema_keys() -> None:
@@ -509,8 +559,12 @@ def test_processor_renders_chinese_guidance_with_stable_schema_keys() -> None:
     prompt = _inject(processor, context).context_messages[-1].content
 
     assert "这是浏览器子代理的持久工作上下文" in prompt
-    assert "每次助理响应结束时" in prompt
-    assert "<browser_context_update>" in prompt
+    assert "当助理响应不调用工具时" in prompt
+    assert "不是工具、函数或能力" in prompt
+    assert "不得将其放入 tool_calls" in prompt
+    assert BROWSER_WORKING_MEMORY_RECORD_BEGIN in prompt
+    assert BROWSER_WORKING_MEMORY_RECORD_END in prompt
+    assert "<browser_context_update>" not in prompt
     assert '"task_list"' in prompt
     assert '"pending|completed"' in prompt
     assert "errors：与恢复有关的简明工具、页面或运行时错误消息" in prompt
@@ -713,7 +767,7 @@ def test_missing_model_update_carries_forward_reconciled_state_with_an_explicit_
         {"task": "Inspect the account", "status": "pending"},
     ]
     assert state.recent_steps[-1].model_memory == state.current
-    assert state.recent_steps[-1].model_update_error == "Model omitted the required browser context update."
+    assert state.recent_steps[-1].model_update_error == "Model omitted the required working-memory record."
 
 
 def test_checkpointed_state_is_restored_by_a_reconstructed_agent_session() -> None:

@@ -17,8 +17,8 @@ from .browser_logging import browser_agent_log_info, browser_agent_log_warning
 
 BROWSER_WORKING_CONTEXT_STATE_KEY = "__browser_subagent_working_context__"
 BROWSER_TOOL_MEMORY_METADATA_KEY = "browser_working_context_retention"
-BROWSER_CONTEXT_UPDATE_OPEN_TAG = "<browser_context_update>"
-BROWSER_CONTEXT_UPDATE_CLOSE_TAG = "</browser_context_update>"
+BROWSER_WORKING_MEMORY_RECORD_BEGIN = "---BEGIN WORKING MEMORY RECORD V1---"
+BROWSER_WORKING_MEMORY_RECORD_END = "---END WORKING MEMORY RECORD V1---"
 
 _ERROR_PREFIXES = (
     "ability execution error:",
@@ -30,14 +30,18 @@ _ERROR_PREFIXES = (
 _WORKING_CONTEXT_INSTRUCTIONS = {
     "en": (
         "This is durable browser-agent working context, separate from the replaceable "
-        "<browser_state> observation. At the end of EVERY assistant response, including a "
-        "response that calls tools, emit exactly one <browser_context_update> JSON object and "
-        "</browser_context_update>. On the first response for a request, create the task_list "
-        'yourself. Every task must use status "pending" or "completed". On every later '
-        "response, review and replace the complete object: task_list, errors, failures, blockers, "
+        "<browser_state> observation. When an assistant response does not call tools, append "
+        "exactly one plain-text working-memory record delimited by "
+        "---BEGIN WORKING MEMORY RECORD V1--- and ---END WORKING MEMORY RECORD V1---. "
+        "When a response calls tools, do not emit the record; the framework carries the previous "
+        "record forward and adds tool results. This record is plain assistant text for framework "
+        "bookkeeping, not a tool, function, or ability. Never place it in tool_calls, and invoke "
+        "only tools explicitly supplied by the runtime. In the first record for a request, create "
+        'the task_list yourself. Every task must use status "pending" or "completed". In every '
+        "later record, review and replace the complete object: task_list, errors, failures, blockers, "
         "key_facts, and important_information. Preserve relevant completed work across follow-ups "
         "and reconcile the list with the new request. Never put credentials, screenshots, image "
-        "data, complete DOM snapshots, or large raw tool output in this update.\n"
+        "data, complete DOM snapshots, or large raw tool output in this record.\n"
         "Field meanings:\n"
         "- task_list: the complete ordered plan for the active request; keep completed tasks and "
         "label every task pending or completed.\n"
@@ -50,17 +54,20 @@ _WORKING_CONTEXT_INSTRUCTIONS = {
         "replacement agent that does not fit another field.\n"
         "Use an empty list [] when a field has no relevant entries. Do not invent facts or mark a "
         "task completed without evidence.\n"
-        "Required update shape: "
+        "Required record JSON shape: "
     ),
     "cn": (
         "这是浏览器子代理的持久工作上下文，与每次替换的 <browser_state> 观察结果相互独立。"
-        "每次助理响应结束时（包括调用工具的响应），必须且只能输出一个 "
-        "<browser_context_update> JSON 对象，并以 </browser_context_update> 结束。"
-        "收到请求后的第一次响应中，请自行创建 task_list。每项任务的 status 必须为 "
-        '"pending" 或 "completed"。之后每次响应都必须检查并完整替换以下字段：'
+        "当助理响应不调用工具时，必须在末尾追加且只能追加一个纯文本工作记忆记录，并使用 "
+        "---BEGIN WORKING MEMORY RECORD V1--- 和 ---END WORKING MEMORY RECORD V1--- 作为分隔符。"
+        "当响应调用工具时，不要输出该记录；框架会沿用上一份记录并加入工具结果。"
+        "该记录只是供框架维护状态的助理文本，不是工具、函数或能力。不得将其放入 tool_calls，"
+        "并且只能调用运行时明确提供的工具。收到请求后的第一份记录中，请自行创建 task_list。"
+        "每项任务的 status 必须为 "
+        '"pending" 或 "completed"。之后每份记录都必须检查并完整替换以下字段：'
         "task_list、errors、failures、blockers、key_facts 和 important_information。"
         "后续请求应保留相关的已完成工作，并根据新请求调整任务列表。"
-        "不要在此更新中写入凭据、截图、图像数据、完整 DOM 快照或大段原始工具输出。\n"
+        "不要在此记录中写入凭据、截图、图像数据、完整 DOM 快照或大段原始工具输出。\n"
         "字段含义：\n"
         "- task_list：当前请求的完整有序计划；保留已完成任务，并将每项任务标记为 pending 或 completed。\n"
         "- errors：与恢复有关的简明工具、页面或运行时错误消息。\n"
@@ -69,10 +76,10 @@ _WORKING_CONTEXT_INSTRUCTIONS = {
         "- key_facts：有浏览器或工具证据支持、与任务相关且已核实的事实。\n"
         "- important_information：后续步骤或接替代理需要、但不适合放入其他字段的持久操作信息。\n"
         "字段没有相关内容时使用空列表 []。没有证据时，不得编造事实或将任务标记为 completed。\n"
-        "必须使用以下更新结构："
+        "记录中的 JSON 必须使用以下结构："
     ),
 }
-_WORKING_CONTEXT_UPDATE_SHAPE = (
+_WORKING_MEMORY_RECORD_SHAPE = (
     '{"task_list":[{"task":"...","status":"pending|completed"}],'
     '"errors":[],"failures":[],"blockers":[],"key_facts":[],'
     '"important_information":[]}'
@@ -433,7 +440,7 @@ class BrowserWorkingContextStore:
             state.one_step_content = []
             self.save(session, state)
 
-        instructions = _WORKING_CONTEXT_INSTRUCTIONS[self.config.language] + _WORKING_CONTEXT_UPDATE_SHAPE
+        instructions = _WORKING_CONTEXT_INSTRUCTIONS[self.config.language] + _WORKING_MEMORY_RECORD_SHAPE
         rendered_state = {
             "request": {
                 "sequence": state.request_sequence,
@@ -571,9 +578,9 @@ class BrowserWorkingContextStore:
 
 
 __all__ = [
-    "BROWSER_CONTEXT_UPDATE_CLOSE_TAG",
-    "BROWSER_CONTEXT_UPDATE_OPEN_TAG",
     "BROWSER_TOOL_MEMORY_METADATA_KEY",
+    "BROWSER_WORKING_MEMORY_RECORD_BEGIN",
+    "BROWSER_WORKING_MEMORY_RECORD_END",
     "BROWSER_WORKING_CONTEXT_STATE_KEY",
     "BrowserPendingStep",
     "BrowserStepRecord",

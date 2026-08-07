@@ -398,9 +398,9 @@ class BrowserAgentRuntime:
                 return False
         return True
 
-    def _register_snapshot_refs(self, value: Any) -> None:
+    def _register_snapshot_refs(self, value: Any, *, replace: bool = False) -> None:
         page_state = self._ensure_page_state()
-        registered = page_state.register_ax_snapshot(value)
+        registered = page_state.replace_ax_snapshot(value) if replace else page_state.register_ax_snapshot(value)
         if registered:
             return
         # Preserve ref-only snapshots that do not follow the normal AX line shape.
@@ -796,9 +796,11 @@ class BrowserAgentRuntime:
 
         dom = ""
         dom_error = None
+        snapshot_captured = False
         try:
             raw_snapshot = await self._call_playwright_tool("browser_snapshot", {})
             raw_snapshot = self._unwrap_mcp_text_result(raw_snapshot)
+            snapshot_captured = True
             if isinstance(raw_snapshot, str):
                 dom = raw_snapshot
             elif raw_snapshot is not None:
@@ -830,6 +832,11 @@ class BrowserAgentRuntime:
                 exc,
                 exc_info=True,
             )
+
+        self._observe_page_url(metadata.get("url"))
+        self._ensure_page_state().observe(title=metadata.get("title"))
+        if snapshot_captured:
+            self._register_snapshot_refs(dom, replace=True)
 
         errors = [error for error in (dom_error, metadata_error) if error]
         return {

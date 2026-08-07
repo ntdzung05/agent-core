@@ -21,9 +21,9 @@ from openjiuwen.core.single_agent.rail.base import (
 )
 
 from .browser_working_context import (
-    BROWSER_CONTEXT_UPDATE_CLOSE_TAG,
-    BROWSER_CONTEXT_UPDATE_OPEN_TAG,
     BROWSER_TOOL_MEMORY_METADATA_KEY,
+    BROWSER_WORKING_MEMORY_RECORD_BEGIN,
+    BROWSER_WORKING_MEMORY_RECORD_END,
     BrowserWorkingContextConfig,
     BrowserWorkingContextStore,
     BrowserWorkingMemory,
@@ -32,9 +32,9 @@ from .browser_working_context import (
 from .browser_logging import browser_agent_log_warning
 
 
-_CONTEXT_UPDATE_RE = re.compile(
-    rf"{re.escape(BROWSER_CONTEXT_UPDATE_OPEN_TAG)}\s*(.*?)\s*"
-    rf"{re.escape(BROWSER_CONTEXT_UPDATE_CLOSE_TAG)}",
+_WORKING_MEMORY_RECORD_RE = re.compile(
+    rf"{re.escape(BROWSER_WORKING_MEMORY_RECORD_BEGIN)}\s*(.*?)\s*"
+    rf"{re.escape(BROWSER_WORKING_MEMORY_RECORD_END)}",
     re.DOTALL | re.IGNORECASE,
 )
 _REQUEST_STARTED_EXTRA_KEY = "_browser_working_context_request_started"
@@ -109,16 +109,19 @@ class BrowserWorkingContextRail(AgentRail):
         if response is None:
             return
 
-        cleaned_content, payloads = self._extract_and_strip_updates(getattr(response, "content", ""))
+        cleaned_content, payloads = self._extract_and_strip_records(getattr(response, "content", ""))
         response.content = cleaned_content
+        tool_calls = getattr(response, "tool_calls", None) or []
 
         memory = None
         update_error = None
-        if len(payloads) != 1:
+        if not payloads and tool_calls:
+            memory = self._carry_forward_memory(ctx)
+        elif len(payloads) != 1:
             update_error = (
-                "Model omitted the required browser context update."
+                "Model omitted the required working-memory record."
                 if not payloads
-                else "Model emitted more than one browser context update."
+                else "Model emitted more than one working-memory record."
             )
         else:
             memory, update_error = self._parse_memory(payloads[0])
@@ -130,7 +133,7 @@ class BrowserWorkingContextRail(AgentRail):
             ctx.session,
             memory=memory,
             model_update_error=update_error,
-            tool_calls=getattr(response, "tool_calls", None) or [],
+            tool_calls=tool_calls,
         )
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
@@ -171,12 +174,12 @@ class BrowserWorkingContextRail(AgentRail):
         try:
             parsed = json.loads(payload)
         except json.JSONDecodeError:
-            return None, "Model emitted invalid JSON in the browser context update."
+            return None, "Model emitted invalid JSON in the working-memory record."
         if not isinstance(parsed, dict):
-            return None, "Model browser context update must be a JSON object."
+            return None, "Model working-memory record must contain a JSON object."
         missing_fields = sorted(_REQUIRED_MEMORY_FIELDS.difference(parsed))
         if missing_fields:
-            return None, (f"Model browser context update omitted required fields: {', '.join(missing_fields)}.")
+            return None, (f"Model working-memory record omitted required fields: {', '.join(missing_fields)}.")
         try:
             memory = BrowserWorkingMemory.model_validate(parsed)
         except ValidationError as exc:
@@ -184,10 +187,34 @@ class BrowserWorkingContextRail(AgentRail):
                 {".".join(str(part) for part in error["loc"]) for error in exc.errors(include_input=False)}
             )
             suffix = f" Invalid fields: {', '.join(invalid_fields)}." if invalid_fields else ""
-            return None, f"Model browser context update failed validation.{suffix}"
+            return None, f"Model working-memory record failed validation.{suffix}"
         if not memory.task_list:
-            return None, "Model browser context update must contain at least one task."
+            return None, "Model working-memory record must contain at least one task."
         return memory, None
+
+    def _carry_forward_memory(
+        self,
+        ctx: AgentCallbackContext,
+    ) -> BrowserWorkingMemory:
+        """Return a complete current record without reporting a tool-step omission."""
+
+        state = self._store.load(ctx.session)
+        memory = self._store.sanitize_memory(state.current)
+        if memory.task_list:
+            return memory
+
+        task = state.active_request or self._latest_user_request(ctx)
+        if not task:
+            task = _FALLBACK_TASK[self.config.language]
+        return self._store.sanitize_memory(
+            memory.model_copy(
+                update={
+                    "task_list": [
+                        BrowserTaskItem(task=task, status="pending"),
+                    ]
+                }
+            )
+        )
 
     def _enforce_context_update(
         self,
@@ -196,36 +223,22 @@ class BrowserWorkingContextRail(AgentRail):
     ) -> BrowserWorkingMemory:
         """Synthesize a complete carry-forward update after invalid model output."""
 
-        state = self._store.load(ctx.session)
-        memory = self._store.sanitize_memory(state.current)
-        if not memory.task_list:
-            task = state.active_request or self._latest_user_request(ctx)
-            if not task:
-                task = _FALLBACK_TASK[self.config.language]
-            memory = self._store.sanitize_memory(
-                memory.model_copy(
-                    update={
-                        "task_list": [
-                            BrowserTaskItem(task=task, status="pending"),
-                        ]
-                    }
-                )
-            )
+        memory = self._carry_forward_memory(ctx)
 
         browser_agent_log_warning(
-            "[BrowserWorkingContextRail] %s Rail synthesized a complete carry-forward context update.",
-            update_error or "Model emitted an invalid browser context update.",
+            "[BrowserWorkingContextRail] %s Rail synthesized a complete carry-forward working-memory record.",
+            update_error or "Model emitted an invalid working-memory record.",
         )
         return memory
 
     @classmethod
-    def _extract_and_strip_updates(
+    def _extract_and_strip_records(
         cls,
         content: Any,
     ) -> tuple[Any, list[str]]:
         if isinstance(content, str):
-            payloads = [match.group(1).strip() for match in _CONTEXT_UPDATE_RE.finditer(content)]
-            return _CONTEXT_UPDATE_RE.sub("", content).strip(), payloads
+            payloads = [match.group(1).strip() for match in _WORKING_MEMORY_RECORD_RE.finditer(content)]
+            return _WORKING_MEMORY_RECORD_RE.sub("", content).strip(), payloads
 
         if not isinstance(content, list):
             return content, []
@@ -234,13 +247,13 @@ class BrowserWorkingContextRail(AgentRail):
         cleaned_parts: list[Any] = []
         for part in content:
             if isinstance(part, str):
-                cleaned, part_payloads = cls._extract_and_strip_updates(part)
+                cleaned, part_payloads = cls._extract_and_strip_records(part)
                 payloads.extend(part_payloads)
                 if cleaned:
                     cleaned_parts.append(cleaned)
                 continue
             if isinstance(part, dict) and isinstance(part.get("text"), str):
-                cleaned, part_payloads = cls._extract_and_strip_updates(part["text"])
+                cleaned, part_payloads = cls._extract_and_strip_records(part["text"])
                 payloads.extend(part_payloads)
                 if cleaned:
                     cleaned_parts.append({**part, "text": cleaned})
