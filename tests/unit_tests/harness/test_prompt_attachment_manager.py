@@ -328,9 +328,6 @@ def test_prompt_attachment_manager_inserts_attachment_before_preserved_tail():
     assert injected[-1] is progress
 
 
-def test_prompt_attachments_section_explains_system_reminder_tags():
-    builder = SystemPromptBuilder(language="en")
-    builder.add_section(build_prompt_attachments_section())
 def test_prompt_attachment_guidance_is_rendered_only_with_attachments():
     manager = PromptAttachmentManager(language="en")
     assert manager.render([]) == ""
