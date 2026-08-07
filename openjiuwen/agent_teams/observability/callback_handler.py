@@ -44,6 +44,7 @@ from openjiuwen.agent_teams.observability.semconv import (
     GEN_AI_REQUEST_MAX_TOKENS,
     GEN_AI_REQUEST_MESSAGE_COUNT,
     GEN_AI_REQUEST_MESSAGE_COUNT_PREFIX,
+    GEN_AI_REQUEST_ID,
     GEN_AI_REQUEST_MODEL,
     GEN_AI_REQUEST_TEMPERATURE,
     GEN_AI_REQUEST_TOP_P,
@@ -63,6 +64,8 @@ from openjiuwen.agent_teams.observability.semconv import (
     GEN_AI_USAGE_CACHE_TOKENS,
     GEN_AI_USAGE_REASONING_TOKENS,
     GEN_AI_REASONING_DURATION_MS,
+    GEN_AI_REASONING_TIMING,
+    REASONING_TIMING_UNMEASURED,
     LANGFUSE_OBSERVATION_INPUT,
     LANGFUSE_OBSERVATION_OUTPUT,
     LANGFUSE_OBSERVATION_TYPE,
@@ -70,6 +73,7 @@ from openjiuwen.agent_teams.observability.semconv import (
 )
 from openjiuwen.agent_teams.observability.span_context import (
     LlmSpanState,
+    get_active_span_tracker,
     get_current_llm_span,
     get_team_span,
     get_current_agent_span,
@@ -78,6 +82,7 @@ from openjiuwen.agent_teams.observability.span_context import (
     push_tool_span,
 )
 from openjiuwen.core.common.logging import team_logger
+from openjiuwen.core.foundation.llm.call_scope import get_current_llm_call_id
 
 
 _TRACER_NAME = "openjiuwen.agent_teams.observability"
@@ -541,12 +546,19 @@ class OtelCallbackHandler:
 
         messages = kwargs.get("messages") or []
         model_name = kwargs.get("model") or self._derive_model_name(kwargs) or "unknown"
+        # Identity of the request this span stands for. Everything that
+        # arrives later — chunks, usage, completion, errors — is matched back
+        # to the span through it, so it must be read here, while the opening
+        # callback still runs inside the caller's LLM call scope.
+        call_id = get_current_llm_call_id()
 
         span = self._tracer().start_span(
             name="llm.call",
             kind=SpanKind.CLIENT,
             context=parent_ctx,
         )
+        if call_id:
+            span.set_attribute(GEN_AI_REQUEST_ID, call_id)
         span.set_attribute(GEN_AI_SYSTEM, _gen_ai_system_name())
         span.set_attribute(GEN_AI_OPERATION_NAME, "chat")
         provider_name = self._derive_provider_name(kwargs)
@@ -696,15 +708,23 @@ class OtelCallbackHandler:
         self._propagate_team_context(span)
         self._stamp_parent_member_name(span)
 
-        _llm_st = LlmSpanState(span=span, start_ns=time.monotonic_ns(), is_streaming=is_streaming)
+        _llm_st = LlmSpanState(
+            span=span,
+            start_ns=time.monotonic_ns(),
+            call_id=call_id,
+            is_streaming=is_streaming,
+        )
         span.otel_llm_state = _llm_st  # attach state to span object (context-immune)
 
+        tracker = get_active_span_tracker()
+        if tracker is not None:
+            tracker.register_llm_span(call_id, span)
 
         team_logger.debug(
             "otel: _open_llm_span name=llm.call trace_id={:032x} span_id={:016x} "
-            "parent_span_id={:016x} streaming={}",
+            "parent_span_id={:016x} streaming={} call_id={}",
             span.context.trace_id, span.context.span_id,
-            span.parent.span_id if span.parent else 0, is_streaming,
+            span.parent.span_id if span.parent else 0, is_streaming, call_id or "<none>",
         )
 
     def _close_llm_span(self, state: LlmSpanState, response: Any) -> None:
@@ -822,9 +842,19 @@ class OtelCallbackHandler:
                     and reasoning_last_ns is not None
                     and reasoning_start_wall_ns is not None
                 )
-                start_kwarg: dict[str, Any] = (
-                    {"start_time": reasoning_start_wall_ns} if has_timing else {}
-                )
+                # Without chunks there is nothing to measure: a non-streaming
+                # call returns reasoning and answer together. Anchor the span at
+                # the start of its llm.call — where the reasoning happened —
+                # instead of letting it default to finalize time, which parks a
+                # zero-length span at the *end* of the call, after the answer it
+                # preceded.
+                call_start_wall_ns = getattr(state.span, "start_time", None)
+                if has_timing:
+                    start_kwarg: dict[str, Any] = {"start_time": reasoning_start_wall_ns}
+                elif call_start_wall_ns is not None:
+                    start_kwarg = {"start_time": call_start_wall_ns}
+                else:
+                    start_kwarg = {}
                 reasoning_span = self._tracer().start_span(
                     name="llm.reasoning",
                     context=set_span_in_context(state.span),
@@ -854,36 +884,73 @@ class OtelCallbackHandler:
                     )
                     reasoning_span.end(end_time=reasoning_start_wall_ns + dur_ns)  # type: ignore[operator]
                 else:
-                    reasoning_span.end()
+                    # No duration attribute: none was measured, and a zero is a
+                    # measurement. The reason is recorded instead.
+                    reasoning_span.set_attribute(
+                        GEN_AI_REASONING_TIMING, REASONING_TIMING_UNMEASURED
+                    )
+                    reasoning_span.end(end_time=call_start_wall_ns)
             except Exception as exc:
                 team_logger.warning("otel: _finalize_llm_span_output reasoning span failed: {}", exc)
 
-    @staticmethod
-    def _record_usage_attrs(state: LlmSpanState, usage: Any, *, skip_existing: bool = False) -> None:
-        """Record usage attributes (tokens, model_name) from usage_metadata."""
+    def _record_usage_attrs(self, state: LlmSpanState, usage: Any, *, skip_existing: bool = False) -> None:
+        """Record usage attributes (tokens, model_name) from usage_metadata.
+
+        Cached prompt tokens and reasoning tokens are *subsets* of the prompt
+        and completion counts the provider reports, not additional tokens. A
+        backend that treats every ``gen_ai.usage.*`` key as its own additive
+        category — Langfuse does, summing them per observation and per trace —
+        then counts the cached prefix twice, which on a long agent run (where
+        most of each prompt is a cache hit) inflates the trace total by more
+        than half.
+
+        For such a backend the subsets are carved out of their parent, so the
+        keys are disjoint and add up to the reported total: ``prompt`` becomes
+        the freshly processed prompt and ``completion`` the visible output.
+        The subtraction is skipped when a subset does not fit inside its parent
+        (a provider counting reasoning outside the completion), leaving the raw
+        numbers rather than inventing one. For plain OTLP consumers nothing
+        changes: ``gen_ai.usage.prompt_tokens`` keeps its semconv meaning of
+        all input tokens.
+
+        Args:
+            state: Span state for the LLM call being recorded.
+            usage: Provider usage metadata.
+            skip_existing: Leave an attribute already written by an earlier
+                trigger untouched.
+        """
         if usage is None:
             return
-        for src_attr, dst_attr in (
-            ("input_tokens", GEN_AI_USAGE_PROMPT_TOKENS),
-            ("output_tokens", GEN_AI_USAGE_COMPLETION_TOKENS),
-            ("total_tokens", GEN_AI_USAGE_TOTAL_TOKENS),
-            ("cache_tokens", GEN_AI_USAGE_CACHE_TOKENS),
-            ("reasoning_tokens", GEN_AI_USAGE_REASONING_TOKENS),
+        prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cache_tokens = int(getattr(usage, "cache_tokens", 0) or 0)
+        reasoning_tokens = int(getattr(usage, "reasoning_tokens", 0) or 0)
+        if self._config is not None and self._config.backend == "langfuse":
+            if 0 < cache_tokens <= prompt_tokens:
+                prompt_tokens -= cache_tokens
+            if 0 < reasoning_tokens <= completion_tokens:
+                completion_tokens -= reasoning_tokens
+
+        for value, dst_attr in (
+            (prompt_tokens, GEN_AI_USAGE_PROMPT_TOKENS),
+            (completion_tokens, GEN_AI_USAGE_COMPLETION_TOKENS),
+            (int(getattr(usage, "total_tokens", 0) or 0), GEN_AI_USAGE_TOTAL_TOKENS),
+            (cache_tokens, GEN_AI_USAGE_CACHE_TOKENS),
+            (reasoning_tokens, GEN_AI_USAGE_REASONING_TOKENS),
         ):
-            value = getattr(usage, src_attr, 0) or 0
             if value and not (skip_existing and state.span.attributes.get(dst_attr)):
-                state.span.set_attribute(dst_attr, int(value))
+                state.span.set_attribute(dst_attr, value)
         model_name = getattr(usage, "model_name", "")
         if model_name and not (skip_existing and state.span.attributes.get(GEN_AI_RESPONSE_MODEL)):
             state.span.set_attribute(GEN_AI_RESPONSE_MODEL, str(model_name))
 
-    @staticmethod
-    def _maybe_record_response_attrs(state: LlmSpanState, response: Any) -> None:
+    def _maybe_record_response_attrs(self, state: LlmSpanState, response: Any) -> None:
+        """Record usage and finish_reason carried by a response or chunk."""
         if response is None:
             return
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
-            OtelCallbackHandler._record_usage_attrs(state, usage, skip_existing=False)
+            self._record_usage_attrs(state, usage, skip_existing=False)
         finish_reason = getattr(response, "finish_reason", None)
         if finish_reason and finish_reason != "null":
             state.span.set_attribute(GEN_AI_RESPONSE_FINISH_REASON, str(finish_reason))

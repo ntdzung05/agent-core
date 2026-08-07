@@ -14,6 +14,44 @@ from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.trace import Span
 
 from openjiuwen.core.common.logging import team_logger
+from openjiuwen.core.foundation.llm.call_scope import get_current_llm_call_id
+
+
+def _is_root_span(span: Span, root_span: Span | None) -> bool:
+    """Report whether *span* is the trace's root span, which a flush must spare.
+
+    Identity against the resolved root span is the reliable test, and the only
+    one that works for a host whose root is not a ``team.<name>`` span (a
+    single-agent run names it after the mode and session). The name prefix
+    stays as a second test for the flush paths that run with no root span in
+    reach — shutdown, or another context's trace.
+
+    Args:
+        span: Candidate span from the tracker's active set.
+        root_span: Root span resolved for the current context, if any.
+
+    Returns:
+        True when the span must be left for its owner to end.
+    """
+    if root_span is not None and span is root_span:
+        return True
+    name = getattr(span, "name", "")
+    return isinstance(name, str) and name.startswith("team.")
+
+
+def _is_open_llm_call_of(span: Span, parent_id: int) -> bool:
+    """Report whether *span* is a still-open ``llm.call`` span under *parent_id*.
+
+    Args:
+        span: Candidate span from the tracker's active set.
+        parent_id: Span id of the parent the caller is resolving against.
+
+    Returns:
+        True when the span is a recording ``llm.call`` whose parent matches.
+    """
+    if span.name != "llm.call" or not span.is_recording():
+        return False
+    return span.parent is not None and span.parent.span_id == parent_id
 
 
 class ActiveSpanTracker(SpanProcessor):
@@ -27,6 +65,11 @@ class ActiveSpanTracker(SpanProcessor):
 
     def __init__(self):
         self._spans_by_trace: dict[int, set[Span]] = {}
+        # Open llm.call spans indexed by the id of the LLM request that
+        # opened them (see ``openjiuwen.core.foundation.llm.call_scope``).
+        # This is the correlation the chunk / usage / completion callbacks
+        # resolve against, so a request always writes onto its own span.
+        self._llm_spans_by_call_id: dict[str, Span] = {}
         self._lock = threading.Lock()
         self._on_start_count = 0
         self._on_end_count = 0
@@ -66,13 +109,35 @@ class ActiveSpanTracker(SpanProcessor):
         try:
             if hasattr(span, 'context') and span.context:
                 trace_id = span.context.trace_id
+                state = getattr(span, "otel_llm_state", None)
+                call_id = getattr(state, "call_id", "") if state is not None else ""
                 with self._lock:
                     trace_set = self._spans_by_trace.get(trace_id)
                     if trace_set is not None:
                         trace_set.discard(cast(Span, span))
+                    # An ended span is never a lookup target again; dropping
+                    # the index entry here is what keeps the map bounded even
+                    # when a close path forgot to pop it.
+                    if call_id and self._llm_spans_by_call_id.get(call_id) is span:
+                        self._llm_spans_by_call_id.pop(call_id, None)
                 self._on_end_count += 1
         except Exception as exc:
             team_logger.warning("ActiveSpanTracker.on_end failed: {}", exc)
+
+    def register_llm_span(self, call_id: str, span: Span) -> None:
+        """Index an open llm.call span under the LLM request that opened it.
+
+        Args:
+            call_id: Id of the LLM request, from the call scope in effect when
+                the span was opened. Empty when the caller reached the callback
+                framework without going through ``Model`` — nothing is indexed
+                then and lookups fall back to parent matching.
+            span: The freshly opened ``llm.call`` span.
+        """
+        if not call_id:
+            return
+        with self._lock:
+            self._llm_spans_by_call_id[call_id] = span
 
     def peek_current_llm_span(self) -> Span | None:
         return self._find_llm_span(pop=False)
@@ -88,7 +153,7 @@ class ActiveSpanTracker(SpanProcessor):
         """
         from opentelemetry.trace import Status, StatusCode
 
-        team_span = _team_span_ctx.get()
+        team_span = _resolve_team_span()
         if team_span is None:
             return 0
         trace_id = team_span.context.trace_id
@@ -129,26 +194,69 @@ class ActiveSpanTracker(SpanProcessor):
         agent_span = _current_agent_span.get()
         if agent_span is not None and agent_span.is_recording():
             return agent_span.context.span_id
-        team_span = _team_span_ctx.get()
+        team_span = _resolve_team_span()
         if team_span is not None and team_span.is_recording():
             return team_span.context.span_id
         return None
 
     def _find_llm_span(self, *, pop: bool) -> Span | None:
-        """Find the recording llm.call span for the current context.
+        """Find the recording llm.call span the current callback belongs to.
 
-        Searches ``_spans_by_trace`` by parent span identity.  When the
-        agent span ContextVar is available, matches by parent_span_id for
-        precise disambiguation across concurrent workers.  Falls back to
-        the most recently opened recording llm span in this trace when
-        parent matching yields no result (cross-task streaming callback,
-        or pre-iteration calls like image probes).
+        Resolution is by request identity first: the LLM call scope in effect
+        names the request whose callback is firing, and the span it opened is
+        indexed under that id.  That is what keeps concurrent requests apart —
+        a member's streaming call, another member's call, and a detached
+        background request such as the image-modality probe each resolve to
+        their own span no matter which task the callback runs in.
+
+        Parent matching is only a fallback, for callers that reach the
+        callback framework without a call scope (a model wrapper that does not
+        go through ``Model``, or a test triggering the events directly).  It
+        answers only when exactly one recording ``llm.call`` span hangs off the
+        current agent/team span; an ambiguous or empty match returns None,
+        because writing a completion onto someone else's span is worse than
+        losing it.
+
+        Args:
+            pop: Whether to release the span from the lookup index, marking
+                the request as finished.
+
+        Returns:
+            The span this callback belongs to, or None when it cannot be
+            identified.
         """
-        team_span = _team_span_ctx.get()
+        call_id = get_current_llm_call_id()
+        if call_id:
+            return self._take_llm_span_by_call_id(call_id, pop=pop)
+        return self._find_llm_span_by_parent()
+
+    def _take_llm_span_by_call_id(self, call_id: str, *, pop: bool) -> Span | None:
+        """Return the span opened by request *call_id*, if it is still open."""
+        with self._lock:
+            span = self._llm_spans_by_call_id.get(call_id)
+            if span is None:
+                return None
+            if not span.is_recording():
+                self._llm_spans_by_call_id.pop(call_id, None)
+                return None
+            if pop:
+                self._llm_spans_by_call_id.pop(call_id, None)
+        return span
+
+    def _find_llm_span_by_parent(self) -> Span | None:
+        """Return the single recording llm.call span under the current parent.
+
+        Returns:
+            The one matching span, or None when the current context has no
+            resolvable parent, no candidate, or more than one candidate.
+        """
+        team_span = _resolve_team_span()
         if team_span is None:
             return None
-        trace_id = team_span.context.trace_id
         parent_id = self._resolve_parent_span_id()
+        if parent_id is None:
+            return None
+        trace_id = team_span.context.trace_id
 
         with self._lock:
             span_set = self._spans_by_trace.get(trace_id)
@@ -156,32 +264,17 @@ class ActiveSpanTracker(SpanProcessor):
                 return None
             all_spans = list(span_set)
 
-        candidates = [s for s in all_spans if s.name == "llm.call" and s.is_recording()]
-        if not candidates:
-            return None
-
-        # Prefer exact parent match for precise disambiguation.
-        if parent_id is not None:
-            exact = [s for s in candidates
-                     if s.parent is not None and s.parent.span_id == parent_id]
-            if exact:
-                result = max(exact, key=lambda s: getattr(getattr(s, "otel_llm_state", None), "start_ns", 0))
-                if pop and result is not None:
-                    with self._lock:
-                        ts = self._spans_by_trace.get(trace_id)
-                        if ts is not None:
-                            ts.discard(result)
-                return result
-
-        # Fallback: most recently opened in this trace (cross-task callback,
-        # or pre-iteration call with no agent span in context).
-        result = max(candidates, key=lambda s: getattr(getattr(s, "otel_llm_state", None), "start_ns", 0))
-        if pop and result is not None:
-            with self._lock:
-                ts = self._spans_by_trace.get(trace_id)
-                if ts is not None:
-                    ts.discard(result)
-        return result
+        exact = [s for s in all_spans if _is_open_llm_call_of(s, parent_id)]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            team_logger.warning(
+                "ActiveSpanTracker: {} open llm.call spans share parent_span_id={:016x} "
+                "and the callback carries no LLM call id — skipping rather than "
+                "guessing which one it belongs to",
+                len(exact), parent_id,
+            )
+        return None
 
     def _on_ending(self, span: Span) -> None:
         pass
@@ -203,10 +296,15 @@ class ActiveSpanTracker(SpanProcessor):
         close callback never fired — logged at error level.  Other spans
         (tool / task / event) reaching this path are also unexpected and
         logged as errors.
+
+        The trace's root span is spared when *exclude_team_span* is set: it is
+        the caller's to end, and closing it here would both steal its end time
+        and report it as leaked.
         """
         from opentelemetry.trace import Status, StatusCode
 
         closed_count = 0
+        root_span = _resolve_team_span() if exclude_team_span else None
 
         with self._lock:
             spans_to_close = list(self._spans_by_trace.pop(trace_id, set()))
@@ -216,7 +314,7 @@ class ActiveSpanTracker(SpanProcessor):
                 if not span.is_recording():
                     continue
 
-                if exclude_team_span and hasattr(span, 'name') and span.name.startswith("team."):
+                if exclude_team_span and _is_root_span(span, root_span):
                     continue
 
                 # Spans with _llm_state are leaked LLM spans — log, don't
@@ -247,6 +345,7 @@ class ActiveSpanTracker(SpanProcessor):
         from opentelemetry.trace import Status, StatusCode
 
         closed_count = 0
+        root_span = _resolve_team_span() if exclude_team_span else None
 
         with self._lock:
             all_traces = list(self._spans_by_trace.items())
@@ -264,7 +363,7 @@ class ActiveSpanTracker(SpanProcessor):
                     if not span.is_recording():
                         continue
 
-                    if exclude_team_span and hasattr(span, 'name') and span.name.startswith("team."):
+                    if exclude_team_span and _is_root_span(span, root_span):
                         continue
 
                     state = getattr(span, "otel_llm_state", None)
@@ -313,6 +412,10 @@ class LlmSpanState:
     Attributes:
         span: The open OTel span for this LLM call.
         start_ns: Monotonic-ns timestamp of when the span was opened.
+        call_id: Id of the LLM request that opened this span, from the call
+            scope in effect at the time. Empty when the call reached the
+            callback framework without one; the span is then not indexed and
+            its later callbacks resolve by parent matching instead.
         is_streaming: Whether this is a streaming (chunk-by-chunk) call.
         first_chunk_ns: Monotonic-ns of the first stream chunk; None until
             the first chunk arrives.
@@ -324,6 +427,7 @@ class LlmSpanState:
 
     span: Span
     start_ns: int
+    call_id: str = ""
     is_streaming: bool = False
     first_chunk_ns: int | None = None
     reasoning_first_ns: int | None = None
@@ -337,9 +441,54 @@ class LlmSpanState:
 
 _team_span_ctx: ContextVar[Span | None] = ContextVar("_team_span_ctx", default=None)
 
+# Process-wide fallback for the trace's root span, used only when the
+# ContextVar carries nothing in the calling context.
+#
+# A team run has no need for it: ``team_runner`` opens the ``team.<name>`` span
+# and every member task is created from that context, so the ContextVar is
+# visible everywhere the callbacks run. A single-agent host is the opposite
+# case — it opens its root span per request, while the agent executes in a
+# supervisor task created earlier (at session setup), which therefore never
+# inherits the binding. Without a fallback every lookup below returns None in
+# that task: llm/tool spans get no parent, the rail skips the agent tier, and
+# ``_find_llm_span`` cannot even locate an already-open ``llm.call`` span to
+# write its completion onto.
+#
+# Registered by the host around one run (see ``set_ambient_team_span``); a
+# single active run is assumed, matching the one-root-span-per-process shape of
+# such hosts.
+_ambient_team_span: Span | None = None
+
+
+def set_ambient_team_span(span: Span | None) -> None:
+    """Register the trace's root span as the process-wide fallback.
+
+    For hosts whose root span cannot be reached through the ContextVar from
+    the task the agent runs in. Pair with :func:`clear_ambient_team_span`.
+
+    Args:
+        span: Root span of the run, or None to clear.
+    """
+    global _ambient_team_span
+    _ambient_team_span = span
+
+
+def clear_ambient_team_span() -> None:
+    """Drop the process-wide root-span fallback registered for a run."""
+    global _ambient_team_span
+    _ambient_team_span = None
+
+
+def _resolve_team_span() -> Span | None:
+    """Return the trace's root span: context binding first, ambient fallback second."""
+    span = _team_span_ctx.get()
+    if span is not None:
+        return span
+    return _ambient_team_span
+
 
 def get_team_span(team_name: str | None = None) -> Span | None:
-    return _team_span_ctx.get()
+    return _resolve_team_span()
 
 
 def set_team_span(span: Span, team_name: str | None = None) -> None:
@@ -504,6 +653,28 @@ def push_tool_span(tool_name: str, span: Span) -> None:
     _tool_span_map.set(mapping)
 
 
+def get_current_tool_span() -> Span | None:
+    """Return the innermost tool span still executing in this context.
+
+    The tool call a sub-agent is dispatched from: the sub-agent runs *inside*
+    ``tool.task`` (or a platform's own agent tool), so its agent span belongs
+    under that tool span rather than beside it.
+
+    Tool spans are keyed by name with no cross-key ordering, so the innermost
+    one is the latest-started still-recording span — tool calls are sequential
+    within an agent loop, which makes start time an unambiguous order.
+
+    Returns:
+        The innermost open tool span, or None when no tool call is running.
+    """
+    open_spans: list[Span] = []
+    for bucket in _tool_span_map.get().values():
+        open_spans.extend(span for span in bucket if span.is_recording())
+    if not open_spans:
+        return None
+    return max(open_spans, key=lambda span: getattr(span, "start_time", 0) or 0)
+
+
 def pop_tool_span(tool_name: str) -> Span | None:
     """Pop the most recent open tool span for tool_name, or None."""
     mapping = dict(_tool_span_map.get())
@@ -596,6 +767,7 @@ def reset_all() -> None:
     _team_span_ctx.set(None)
     _current_agent_span.set(None)
     _tool_span_map.set({})
+    clear_ambient_team_span()
 
 
 def flush_child_spans(*, trace_id: int | None = None) -> None:
@@ -605,10 +777,10 @@ def flush_child_spans(*, trace_id: int | None = None) -> None:
     ``finalize_trace``), only that trace's spans are closed — other
     teams' spans are never touched.
 
-    When *trace_id* is ``None``, the call site must be operating while
-    ``_team_span_ctx`` is still valid (e.g. ``cascade_close_children``
-    during an agent-span close).  In that case the trace_id is
-    discovered from the current team span.
+    When *trace_id* is ``None``, the call site must be operating while the
+    trace's root span is still resolvable — its ContextVar binding, or the
+    ambient registration (e.g. ``cascade_close_children`` during an
+    agent-span close).  In that case the trace_id is discovered from it.
 
     The previous ``flush_all_spans`` fallback (when ``_team_span_ctx``
     was ``None``) has been **removed** — it caused one team's finalize
@@ -621,7 +793,7 @@ def flush_child_spans(*, trace_id: int | None = None) -> None:
     try:
         effective_trace_id: int | None = trace_id
         if effective_trace_id is None:
-            team_span = _team_span_ctx.get()
+            team_span = _resolve_team_span()
             if team_span is not None and hasattr(team_span, 'context') and team_span.context:
                 effective_trace_id = team_span.context.trace_id
 

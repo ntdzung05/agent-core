@@ -125,9 +125,6 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
 )
 from openjiuwen.harness.prompts.sections import SectionName
 from openjiuwen.harness.prompts.sections.identity import build_identity_section
-from openjiuwen.harness.prompts.sections.prompt_attachments import (
-    build_prompt_attachments_section,
-)
 from openjiuwen.harness.resources import (
     LoadRecord,
     find_agent_template_manifest,
@@ -515,6 +512,7 @@ class DeepAgent(BaseAgent):
         """
         language = resolve_language(config.language)
         mode = resolve_mode(config.prompt_mode)
+        self.prompt_attachment_manager.language = language
         prompt_builder = SystemPromptBuilder(language=language, mode=mode)
         if config.system_prompt:
             prompt_builder.add_section(PromptSection(
@@ -524,7 +522,7 @@ class DeepAgent(BaseAgent):
             ))
         else:
             prompt_builder.add_section(build_identity_section(language))
-        prompt_builder.add_section(build_prompt_attachments_section(language))
+        prompt = prompt_builder.build()
         new_react_config = self._react_agent.config.model_copy()
         new_react_config.prompt_template = [
             {"role": "system", "content": _render_identity_prompt(prompt_builder, language)}
@@ -911,6 +909,7 @@ class DeepAgent(BaseAgent):
 
         language = resolve_language(cfg.language)
         mode = resolve_mode(cfg.prompt_mode)
+        self.prompt_attachment_manager.language = language
         prompt_builder = SystemPromptBuilder(language=language, mode=mode)
         if cfg.system_prompt:
             # Wrap the provided prompt as the identity section so all
@@ -922,10 +921,8 @@ class DeepAgent(BaseAgent):
             ))
         else:
             prompt_builder.add_section(build_identity_section(language))
-        prompt_builder.add_section(build_prompt_attachments_section(language))
-        react_config.prompt_template = [
-            {"role": "system", "content": _render_identity_prompt(prompt_builder, language)}
-        ]
+        prompt = prompt_builder.build()
+        react_config.prompt_template = [{"role": "system", "content": prompt}]
 
         if cfg.model is not None:
             model = cfg.model
@@ -2964,6 +2961,14 @@ class DeepAgent(BaseAgent):
                     f"Interaction loop already bound to session {self._bound_session_id}; "
                     f"cannot bind {sid}."
                 )
+
+            # The controller starts its long-lived TaskScheduler inside
+            # prepare_interaction_task_loop().  Create the mutable worktree
+            # holder first so the scheduler, supervisor, rounds, and tool
+            # tasks all inherit the same object through their copied Context.
+            from openjiuwen.harness.tools.worktree.session import init_session_state
+
+            init_session_state()
 
             self._interaction_session = session
             await self.prepare_interaction_task_loop(session)

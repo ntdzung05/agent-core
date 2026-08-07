@@ -67,6 +67,29 @@ def _is_disabled_free_search_tool(tool: Tool | ToolCard) -> bool:
     return card.name == "free_search" and not is_free_search_enabled()
 
 
+def _append_env_online_training_rail(rails: list[AgentRail]) -> list[AgentRail]:
+    """Append env-configured online training rail without exposing it to hosts.
+
+    JiuwenSwarm and other harness hosts only need to set environment variables.
+    The online-RL package owns the concrete rail selection and gateway wiring.
+    """
+    try:
+        from openjiuwen.agent_evolving.agent_rl.online.rail import (
+            RLOnlineRail,
+            build_rl_online_rail_from_env,
+        )
+    except ImportError as exc:
+        logger.warning("Failed to import online training rail factory: %s", exc)
+        return rails
+
+    if any(isinstance(rail, RLOnlineRail) for rail in rails):
+        return rails
+    rail = build_rl_online_rail_from_env()
+    if rail is None:
+        return rails
+    return [*rails, rail]
+
+
 def _normalize_tools(
     tools: Optional[List[Tool | ToolCard]],
 ) -> tuple[List[ToolCard], List[Tool]]:
@@ -103,8 +126,17 @@ def _inject_general_purpose_subagent(
     mcps: Optional[List[McpServerConfig]],
     model: Model,
     skills: Optional[List[str]],
+    workspace: Optional[Workspace] = None,
+    sys_operation: Optional[SysOperation] = None,
 ) -> list[SubAgentConfig | DeepAgent]:
-    """Inject general-purpose subagent if requested and not already present."""
+    """Inject general-purpose subagent if requested and not already present.
+
+    ``workspace`` and ``sys_operation`` are the parent agent's resolved values;
+    the injected spec carries both so ``create_subagent`` keeps it inside the
+    parent's filesystem boundary instead of minting a fresh LOCAL
+    sys_operation for it (``create_subagent`` only adopts a spec's
+    sys_operation when its workspace is set as well).
+    """
     effective_subagents = list(subagents or [])
     if not add_general_purpose_agent:
         return effective_subagents
@@ -130,6 +162,8 @@ def _inject_general_purpose_subagent(
         model=model,
         skills=skills,
         rails=gp_rails,
+        workspace=workspace,
+        sys_operation=sys_operation,
         restrict_to_work_dir=False,
     ))
     return effective_subagents
@@ -237,18 +271,6 @@ def resolve_deep_agent_parts(
         False if vision_tools_enabled else enable_read_image_multimodal
     )
 
-    effective_subagents = _inject_general_purpose_subagent(
-        subagents,
-        add_general_purpose_agent=add_general_purpose_agent,
-        resolved_language=resolved_language,
-        rails=rails,
-        system_prompt=system_prompt,
-        tools=tools,
-        mcps=mcps,
-        model=model,
-        skills=skills,
-    )
-
     if not workspace:
         workspace_obj = Workspace(root_path="./", language=resolved_language)
     elif isinstance(workspace, (str, PathLike)):
@@ -283,6 +305,24 @@ def resolve_deep_agent_parts(
             sys_operation_obj = Runner.resource_mgr.get_sys_operation(sysop_id)
     else:
         sys_operation_obj = sys_operation
+
+    # Injected after the workspace / sys_operation are resolved so the
+    # general-purpose sub-agent can carry them: a spec without both makes
+    # create_subagent fall back to a fresh LOCAL sys_operation, which leaves
+    # this agent's sandbox behind.
+    effective_subagents = _inject_general_purpose_subagent(
+        subagents,
+        add_general_purpose_agent=add_general_purpose_agent,
+        resolved_language=resolved_language,
+        rails=rails,
+        system_prompt=system_prompt,
+        tools=tools,
+        mcps=mcps,
+        model=model,
+        skills=skills,
+        workspace=workspace_obj,
+        sys_operation=sys_operation_obj,
+    )
 
     config = DeepAgentConfig(
         model=model,
@@ -369,6 +409,7 @@ def resolve_deep_agent_parts(
     for rail_cls, should_add, make_rail in default_rails:
         if should_add and not _already_provided(rail_cls):
             all_rails.append(make_rail())
+    all_rails = _append_env_online_training_rail(all_rails)
 
     return DeepAgentParts(
         config=config,
