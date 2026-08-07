@@ -328,7 +328,6 @@ def test_reconstructed_deep_agents_share_inner_persistence_identity() -> None:
     assert second.react_agent.card.id == persistence_id
 
 
-def test_prompt_attachment_reminder_is_in_initial_and_hot_reloaded_system_prompt() -> None:
 def test_prompt_attachment_reminder_is_not_in_static_system_prompt() -> None:
     agent = DeepAgent(AgentCard(name="deep", description="test")).configure(
         DeepAgentConfig(
