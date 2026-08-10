@@ -333,15 +333,6 @@ class TeamAgentSpec(BaseModel):
     always available regardless of this flag. Overridable per team
     instance at ``build_team`` time. See F_62.
     """
-    verify_vote_threshold: float = 2 / 3
-    """Pass quorum for multi-reviewer verification under scheduled dispatch.
-
-    A task in review completes when ``pass_votes >= ceil(threshold * n)``
-    over ``n = len(reviewer)``, and is sent back for rework as soon as
-    that quorum becomes unreachable. Consumed only by the leader-side
-    scheduler (single judge), so it is not mirrored onto ``TeamSpec``.
-    Range ``0 < threshold <= 1``. See F_62.
-    """
     default_max_review_rounds: int = 3
     """Default per-task review-round ceiling (scheduled dispatch).
 
@@ -614,10 +605,6 @@ class TeamAgentSpec(BaseModel):
         The scheduler consumes these without further guarding, so an
         out-of-range value must fail at spec time, not mid-run.
         """
-        if not 0 < self.verify_vote_threshold <= 1:
-            raise ValueError(
-                f"verify_vote_threshold must be in (0, 1], got {self.verify_vote_threshold}",
-            )
         if self.default_max_review_rounds < 1:
             raise ValueError(
                 f"default_max_review_rounds must be >= 1, got {self.default_max_review_rounds}",
