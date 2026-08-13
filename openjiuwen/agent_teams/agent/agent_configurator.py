@@ -534,6 +534,7 @@ class AgentConfigurator:
                     "teammate_mode": teammate_mode,
                     "dispatch_mode": spec.dispatch_mode,
                     "lifecycle": spec.lifecycle,
+                    "team_mode": _resolve_team_mode(spec),
                     "exclude_tools": exclude,
                     "qualify_ids": spec.spawn_mode == "inprocess",
                     "team_name": resolved_team_name,
@@ -554,6 +555,7 @@ class AgentConfigurator:
                     "team_workspace_mount": team_workspace_mount,
                     "team_workspace_path": team_workspace_path,
                     "expose_human_agents_to_teammates": spec.expose_human_agents_to_teammates,
+                    "steer_batch_size": spec.steer_batch_size,
                 },
             ),
         ]
@@ -873,6 +875,7 @@ class AgentConfigurator:
             enable_bridge=spec.enable_bridge,
             dispatch_mode=spec.dispatch_mode,
             enable_task_verification=spec.enable_task_verification,
+            enable_fork=spec.enable_fork,
             external_cli_agents=spec.external_cli_agents,
             on_before_team_cleaned=on_before_team_cleaned,
             on_team_cleaned=on_team_cleaned,
