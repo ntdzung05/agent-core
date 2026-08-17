@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -40,29 +39,11 @@ from openjiuwen.harness.schema.config import (
 from openjiuwen.harness.workspace.workspace import Workspace
 from openjiuwen.harness.prompts import resolve_language
 from openjiuwen.harness.prompts.tools.task_tool import GENERAL_PURPOSE_AGENT_DESC
+from openjiuwen.harness.skills import collect_disabled_skills
 from openjiuwen.harness.tools import create_vision_tools, is_free_search_enabled
 
 if TYPE_CHECKING:
     from openjiuwen.agent_evolving.trajectory.processor import TrajectorySpanProcessor
-
-
-def _collect_disabled_skills_from_state(skills_dirs: list[str]) -> list[str]:
-    """Read skills_state.json from each skills_dir and collect disabled skill names."""
-    disabled: set[str] = set()
-    for skills_dir in skills_dirs:
-        state_path = Path(skills_dir) / "skills_state.json"
-        if not state_path.is_file():
-            continue
-        try:
-            data = json.loads(state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            logger.warning("Failed to read skills_state.json at %s", state_path)
-            continue
-        skill_configs = data.get("skill_configs", {})
-        for name, cfg in skill_configs.items():
-            if isinstance(cfg, dict) and cfg.get("enabled") is False:
-                disabled.add(name)
-    return sorted(disabled)
 
 
 def _is_disabled_free_search_tool(tool: Tool | ToolCard) -> bool:
@@ -388,7 +369,7 @@ def resolve_deep_agent_parts(
         # exist — SkillUseRail skips missing directories at refresh time.
         for _team_id, target_path in workspace_obj.list_team_links():
             skills_dirs.append(str(Path(target_path) / "skills"))
-        disabled_skills = _collect_disabled_skills_from_state(skills_dirs)
+        disabled_skills = collect_disabled_skills(skills_dirs)
         # ``include_tools`` registers read_file / code / bash so skills can do
         # file/shell ops. When a SysOperationRail is already mounted it owns
         # those tools (and refresh-binds them to the live sys_operation), so

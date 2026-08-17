@@ -41,6 +41,9 @@ from openjiuwen.harness.rails.evolution.review.subagent import (
     remove_evolution_review_agent_config,
 )
 from openjiuwen.harness.rails.evolution.skill_evolution_rail import SkillEvolutionRail
+from openjiuwen.harness.rails.evolution.member_skill_evolution_rail import (
+    MemberSkillEvolutionRail,
+)
 from openjiuwen.harness.rails.evolution.skill_evolution_sharing import SkillEvolutionSharingMixin
 from openjiuwen.harness.rails.evolution.team_context_evolution_rail import (
     MergedMemoryItem,
@@ -67,6 +70,7 @@ __all__ = [
     "SimplifyRequestResult",
     "SkillCreateRail",
     "SkillEvolutionRail",
+    "MemberSkillEvolutionRail",
     "SkillEvolutionSharingMixin",
     "TeamSkillCreateRail",
     "TeamSkillEvolutionRail",

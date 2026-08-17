@@ -321,10 +321,12 @@ class TestTeamSkillCreateRailFollowUp:
         assert len(events) == 1
         event = events[0]
         assert event.type == "chat.ask_user_question"
-        assert event.payload["source"] == "skill_creation_approval"
-        assert event.payload["approval_schema"] == "openjiuwen.skill_creation_approval.v1"
+        assert event.payload["source"] == "skill_evolution_approval"
+        assert event.payload["approval_schema"] == "openjiuwen.skill_evolution_approval.v1"
         request_id = event.payload["request_id"]
-        assert request_id.startswith("skill_create_")
+        assert request_id.startswith("team_skill_evolve_create_")
+        assert event.payload["evolution_meta"]["approval_kind"] == "create"
+        assert event.payload["evolution_meta"]["rail_kind"] == "team"
         assert rail.owns_external_proposal(request_id) is True
         question = event.payload["questions"][0]
         assert question["header"] == "新建 Skill 审批"

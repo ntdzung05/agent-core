@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from contextvars import Context
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -333,7 +334,7 @@ def _prepared_input(
     if trajectory is None:
         trajectory = _trajectory_with_messages([])
     if messages is None:
-        messages = _REAL_SKILL_EVOLUTION_RAIL._collect_messages_from_trajectory(trajectory)
+        messages = _REAL_SKILL_EVOLUTION_RAIL._trajectory_to_messages(trajectory)
     return _SkillPreparedEvolutionInput(
         trajectory=trajectory,
         messages=tuple(messages),
@@ -785,30 +786,51 @@ async def test_evolve_review_task_uses_fixed_evolution_reviewer_subagent(monkeyp
     from openjiuwen.harness.rails.evolution.review.subagent import EVOLUTION_REVIEW_AGENT_NAME
 
     captured = {}
+    runtime = EvolutionReviewRuntime()
+    launch = runtime.create_scope(
+        source="explicit_command",
+        subject={"kind": "skill", "name": "skill-a"},
+        session_id="session-1",
+    )
 
     async def fake_invoke(self, inputs, **kwargs):
         del self
         captured["inputs"] = inputs
         captured["kwargs"] = kwargs
+        runtime.record_review_result(
+            launch.evolution_review_ref,
+            session_id="session-1",
+            result={
+                "subject": {"kind": "skill", "name": "skill-a"},
+                "outcome": "no_evolution",
+                "evidence_refs": [],
+                "proposals": [],
+            },
+        )
         return SimpleNamespace(success=True, data={"output": '{"ok": true}', "agent_id": "subagent-1"})
 
     monkeypatch.setattr("openjiuwen.agent_evolving.tools.skill.TaskTool.invoke", fake_invoke)
-    tool = EvolveReviewTaskTool(parent_agent=Mock(), language="cn", agent_id="agent-1")
+    tool = EvolveReviewTaskTool(
+        parent_agent=Mock(),
+        review_runtime=runtime,
+        language="cn",
+        agent_id="agent-1",
+    )
 
     result = await tool.invoke(
         {
-            "evolution_review_ref": "review-ref-1",
+            "evolution_review_ref": launch.evolution_review_ref,
             "user_intent": "capture parser lesson",
             "subject": {"kind": "skill", "name": "skill-a"},
         },
-        session=object(),
+        conversation_id="session-1",
     )
 
     assert result.success is True
     assert captured["inputs"]["subagent_type"] == EVOLUTION_REVIEW_AGENT_NAME
-    assert "review-ref-1" in captured["inputs"]["task_description"]
+    assert launch.evolution_review_ref in captured["inputs"]["task_description"]
     assert "capture parser lesson" in captured["inputs"]["task_description"]
-    assert captured["kwargs"]["session"] is not None
+    assert captured["kwargs"]["conversation_id"] == "session-1"
 
 
 @pytest.mark.asyncio
@@ -1452,6 +1474,43 @@ async def test_prepare_evolution_review_scope_rejects_mismatched_or_empty_window
 
 
 @pytest.mark.asyncio
+async def test_prepare_evolution_review_scope_resolves_detached_invoke_capture(tmp_path):
+    rail = _make_rail(tmp_path)
+    session = SimpleNamespace(
+        get_session_id=lambda: "conv-1",
+        get_agent_id=lambda: "agent-1",
+    )
+    ctx = AgentCallbackContext(
+        agent=SimpleNamespace(card=SimpleNamespace(id="agent-1")),
+        inputs=InvokeInputs(query="round 1", conversation_id="conv-1"),
+        session=session,
+    )
+    await rail.before_invoke(ctx)
+    trajectory = _trajectory_with_messages([{"role": "user", "content": "round 1"}])
+    rail.get_trajectory = Mock(return_value=trajectory)
+
+    scope = Context().run(
+        rail._prepare_evolution_review_scope,
+        source="explicit_command",
+        subject={"kind": "skill", "name": "skill-a"},
+        session_id="conv-1",
+        member_id="agent-1",
+        user_intent="capture lesson",
+    )
+
+    resolved_scope = rail._review_runtime.resolve_scope(
+        scope.evolution_review_ref,
+        session_id="conv-1",
+    )
+    assert resolved_scope.session_id == "conv-1"
+    rail.get_trajectory.assert_called_once_with(
+        session_id="conv-1",
+        member_id="agent-1",
+        team_id=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_evolution_auto_save_commits_via_manager_lifecycle(tmp_path):
     rail = _make_rail(tmp_path, signal_trigger=True, auto_save=True)
     approval_request = SimpleNamespace(request_id="skill_evolve_req")
@@ -1465,6 +1524,7 @@ async def test_run_evolution_auto_save_commits_via_manager_lifecycle(tmp_path):
     rail._stage_evolution_from_signals = AsyncMock(return_value=_staged_result(approval_request))
     rail._emit_generated_records = AsyncMock()
     trajectory = _trajectory_with_messages(messages)
+    normalized_messages = rail._trajectory_to_messages(trajectory)
 
     await rail.run_evolution(_prepared_input(trajectory))
 
@@ -1472,7 +1532,7 @@ async def test_run_evolution_auto_save_commits_via_manager_lifecycle(tmp_path):
     rail._stage_evolution_from_signals.assert_awaited_once_with(
         skill_name="skill-a",
         signals=signals,
-        messages=messages,
+        messages=normalized_messages,
         trajectory=trajectory,
         user_query="",
         requires_approval=False,
@@ -1531,6 +1591,7 @@ async def test_run_evolution_auto_save_false_emits_events(tmp_path):
     rail._evolution_store.list_skill_names = Mock(return_value=["skill-a"])
     rail._stage_evolution_from_signals = AsyncMock(return_value=_staged_result(approval_request))
     rail._emit_generated_records = AsyncMock()
+    normalized_messages = rail._trajectory_to_messages(trajectory)
 
     await rail.run_evolution(_prepared_input(trajectory))
 
@@ -1538,7 +1599,7 @@ async def test_run_evolution_auto_save_false_emits_events(tmp_path):
     rail._stage_evolution_from_signals.assert_awaited_once_with(
         skill_name="skill-a",
         signals=signals,
-        messages=messages,
+        messages=normalized_messages,
         trajectory=trajectory,
         user_query="",
         requires_approval=True,
@@ -1569,13 +1630,14 @@ async def test_run_evolution_auto_save_false_emits_real_approval_event(tmp_path)
         request_id="skill_evolve_req",
     )
     rail._stage_evolution_from_signals = AsyncMock(return_value=_staged_result(approval_request))
+    normalized_messages = rail._trajectory_to_messages(trajectory)
     await rail.run_evolution(_prepared_input(trajectory))
 
     signals = rail._stage_evolution_from_signals.await_args.kwargs["signals"]
     rail._stage_evolution_from_signals.assert_awaited_once_with(
         skill_name="skill-a",
         signals=signals,
-        messages=messages,
+        messages=normalized_messages,
         trajectory=trajectory,
         user_query="",
         requires_approval=True,

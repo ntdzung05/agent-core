@@ -22,6 +22,7 @@ from openjiuwen.core.common.logging import logger
 from openjiuwen.core.session.stream import OutputSchema
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.prompts.sections import SectionName
+from openjiuwen.harness.rails.evolution.contracts import EvolutionHostEventMeta
 from openjiuwen.harness.rails.evolution.evolution_rail import (
     EvolutionRail,
     EvolutionTriggerPoint,
@@ -39,8 +40,8 @@ _TEAM_SPAWN_TOOL_NAMES = {
 _AUTO_TEAM_SKILL_CREATION_FOLLOW_UP_TAG = "auto_team_skill_creation_followup"
 _MAX_EXTERNAL_EVIDENCE_ITEMS = 12
 _MAX_EXTERNAL_EVIDENCE_CHARS = 8_000
-_SKILL_CREATION_APPROVAL_SOURCE = "skill_creation_approval"
-_SKILL_CREATION_APPROVAL_SCHEMA = "openjiuwen.skill_creation_approval.v1"
+_SKILL_CREATION_APPROVAL_SOURCE = "skill_evolution_approval"
+_SKILL_CREATION_APPROVAL_SCHEMA = "openjiuwen.skill_evolution_approval.v1"
 
 
 @dataclass(frozen=True)
@@ -207,7 +208,9 @@ class TeamSkillCreateRail(_TeamTrajectoryCaptureMixin, EvolutionRail):
         if normalized_key in self._external_proposal_keys:
             return False
 
-        request_id = f"skill_create_{uuid4().hex}"
+        # Reuse the established team Skill-evolution approval transport. The
+        # mounted TeamSkillEvolutionRail owns routing and lifecycle.
+        request_id = f"team_skill_evolve_create_{uuid4().hex}"
         proposal = PendingSkillCreationProposal(
             request_id=request_id,
             proposal_key=normalized_key,
@@ -324,6 +327,15 @@ class TeamSkillCreateRail(_TeamTrajectoryCaptureMixin, EvolutionRail):
                 "request_id": proposal.request_id,
                 "source": _SKILL_CREATION_APPROVAL_SOURCE,
                 "approval_schema": _SKILL_CREATION_APPROVAL_SCHEMA,
+                "evolution_meta": {
+                    **EvolutionHostEventMeta(
+                        event_kind="approval",
+                        rail_kind="team",
+                        request_id=proposal.request_id,
+                    ).to_payload(),
+                    "approval_kind": "create",
+                    "source": "scheduler_review_feedback",
+                },
                 "questions": [
                     {
                         "question": question[:_MAX_EXTERNAL_EVIDENCE_CHARS],

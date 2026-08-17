@@ -49,6 +49,7 @@ from openjiuwen.core.single_agent.rail.base import (
     TaskIterationInputs,
     ToolCallInputs,
 )
+from openjiuwen.core.session.stream import OutputSchema
 from openjiuwen.harness.rails.evolution.approval_runtime import EvolutionApprovalRuntime
 from openjiuwen.harness.rails.evolution.contracts import (
     EvolutionRequestResult,
@@ -94,6 +95,114 @@ def test_team_completion_followup_prompts_are_short_and_reference_standing_rules
     assert "append only one or two sentences" in _TEAM_COMPLETION_FOLLOWUP_PROMPT_EN
     assert "include both the reusable team update" in _TEAM_COMPLETION_FOLLOWUP_PROMPT_EN
     assert "prepare_skill_evolution" not in _TEAM_COMPLETION_FOLLOWUP_PROMPT_EN
+
+
+def test_review_feedback_uses_mounted_team_rail_lifecycle(tmp_path):
+    rail = _team_skill_rail(
+        str(tmp_path / "team-skills"),
+        llm=MagicMock(),
+        model="mock-model",
+        signal_trigger=False,
+        async_evolution=False,
+    )
+
+    rail.configure_review_feedback_evolution(
+        global_skills_dir=tmp_path / "global-skills",
+        trajectory_registry=object(),
+        session_id="session-1",
+        team_id="team-1",
+    )
+
+    assert rail.review_feedback_evolution_enabled is True
+    assert rail._review_feedback_global_rail is not None
+    assert (
+        rail._review_feedback_global_rail._online_request_id_prefix()
+        == "team_skill_evolve"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_feedback_child_events_and_creation_approval_use_parent_queue(
+    tmp_path,
+):
+    rail = _team_skill_rail(
+        str(tmp_path / "team-skills"),
+        llm=MagicMock(),
+        model="mock-model",
+        signal_trigger=False,
+        async_evolution=False,
+    )
+    creation_rail = SimpleNamespace(
+        _pending_external_proposals={"team_skill_evolve_create_1": object()},
+        owns_external_proposal=lambda request_id: (
+            request_id == "team_skill_evolve_create_1"
+        ),
+        resolve_external_proposal=lambda request_id, *, accepted: (
+            "create approved Skill" if accepted else None
+        ),
+    )
+    rail.bind_review_feedback_skill_create_rail(creation_rail)
+    event = OutputSchema(
+        type="chat.ask_user_question",
+        index=0,
+        payload={"request_id": "team_skill_evolve_create_1"},
+    )
+
+    await rail._relay_review_feedback_events("skill_creation", [event])
+
+    assert rail.owns_approval_request("team_skill_evolve_create_1") is True
+    assert await rail.drain_pending_approval_events(wait=False) == [event]
+    await rail.approve_record("team_skill_evolve_create_1")
+    assert (
+        rail.pop_approval_continuation("team_skill_evolve_create_1")
+        == "create approved Skill"
+    )
+    assert rail.owns_approval_request("team_skill_evolve_create_1") is False
+
+
+@pytest.mark.asyncio
+async def test_review_feedback_partial_global_approval_keeps_parent_request(tmp_path):
+    rail = _team_skill_rail(
+        str(tmp_path / "team-skills"),
+        llm=MagicMock(),
+        model="mock-model",
+        signal_trigger=False,
+        async_evolution=False,
+    )
+
+    class _GlobalRail:
+        def __init__(self):
+            self._pending_approval_snapshots = {
+                "team_skill_evolve_1": {"records": ["record-1", "record-2"]}
+            }
+
+        async def approve_record(self, request_id, *, approved_record_ids=None):
+            if approved_record_ids == ["record-1"]:
+                self._pending_approval_snapshots[request_id] = {
+                    "records": ["record-2"]
+                }
+            else:
+                self._pending_approval_snapshots.pop(request_id, None)
+
+    global_rail = _GlobalRail()
+    rail._review_feedback_global_rail = global_rail
+    rail._pending_approval_snapshots["team_skill_evolve_1"] = {
+        "records": ["record-1", "record-2"]
+    }
+
+    await rail.approve_record(
+        "team_skill_evolve_1",
+        approved_record_ids=["record-1"],
+    )
+
+    assert rail.owns_approval_request("team_skill_evolve_1") is True
+    assert rail._pending_approval_snapshots["team_skill_evolve_1"] == {
+        "records": ["record-2"]
+    }
+
+    await rail.approve_record("team_skill_evolve_1")
+
+    assert rail.owns_approval_request("team_skill_evolve_1") is False
 
 
 @pytest.mark.asyncio
@@ -407,7 +516,7 @@ def _prepared_input(
     presented_entries: list[tuple[str, Any, str]] | None = None,
 ) -> _SkillPreparedEvolutionInput:
     if messages is None:
-        messages = SkillEvolutionRail._collect_messages_from_trajectory(trajectory)
+        messages = SkillEvolutionRail._trajectory_to_messages(trajectory)
     return _SkillPreparedEvolutionInput(
         trajectory=trajectory,
         messages=tuple(messages),
