@@ -20,7 +20,8 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple, Un
 
 from pydantic import Field, BaseModel
 
-from openjiuwen.core.common.exception.errors import BaseError
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError, build_error, raise_error
 from openjiuwen.core.common.logging import logger
 try:
     from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
@@ -1135,6 +1136,7 @@ class ReActAgent(BaseAgent):
                 else:
                     raise
             ctx.inputs.response = ai_message
+            self._raise_for_model_response_error(ai_message)
             return ai_message
 
         # Streaming path: accumulate chunks via __add__, write to session in real-time
@@ -1214,6 +1216,7 @@ class ReActAgent(BaseAgent):
                 logprobs=accumulated_chunk.logprobs,
             )
         ctx.inputs.response = ai_message
+        self._raise_for_model_response_error(ai_message)
         if ai_message.usage_metadata:
 
             perf_metrics = {}
@@ -1237,6 +1240,30 @@ class ReActAgent(BaseAgent):
                 },
             ))
         return ai_message
+
+    @staticmethod
+    def _raise_for_model_response_error(message: AssistantMessage) -> None:
+        """Turn provider error responses into rail-visible exceptions."""
+        finish_reason = str(getattr(message, "finish_reason", "") or "").strip().lower()
+        usage = getattr(message, "usage_metadata", None)
+        code = int(getattr(usage, "code", 0) or 0)
+        if finish_reason not in {"error", "failed"} and code == 0:
+            return
+        error_message = str(getattr(usage, "err_msg", "") or getattr(message, "content", "") or "")
+        provider_detail = (
+            f"provider response error: code={code}, "
+            f"finish_reason={finish_reason or 'unknown'}, "
+            f"message={error_message[:500] or 'provider returned no error detail'}"
+        )
+        raise_error(
+            StatusCode.MODEL_CALL_FAILED,
+            error_msg=provider_detail,
+            details={
+                "provider_code": code,
+                "finish_reason": finish_reason or "unknown",
+                "provider_message": error_message[:500],
+            },
+        )
 
     @staticmethod
     def _messages_contain_image_input(messages: Optional[List[Any]]) -> bool:
@@ -1895,9 +1922,6 @@ class ReActAgent(BaseAgent):
 
         if has_read_file:
             return
-
-        from openjiuwen.core.common.exception.codes import StatusCode
-        from openjiuwen.core.common.exception.errors import build_error
 
         err = build_error(
             StatusCode.AGENT_TOOL_NOT_FOUND,
