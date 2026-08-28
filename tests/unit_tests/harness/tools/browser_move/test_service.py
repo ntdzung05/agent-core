@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
     BrowserRunGuardrails,
@@ -570,6 +572,32 @@ def test_profile_store_defaults_to_runtime_workspace() -> None:
     service = _make_service(runtime_cwd=str(expected_root))
     expected = expected_root / ".browser" / "profiles.json"
     assert getattr(service, "_profile_store").path.resolve() == expected
+
+
+def test_validate_mcp_command_accepts_absolute_node_without_npx(tmp_path: Path) -> None:
+    node = tmp_path / "Node Runtime" / ("node.exe" if os.name == "nt" else "node")
+    node.parent.mkdir()
+    node.write_text("test", encoding="utf-8")
+    node.chmod(0o755)
+    service = _make_service()
+    service.mcp_cfg.params["command"] = str(node.resolve())
+
+    with patch(
+        "openjiuwen.harness.tools.browser_move.playwright_runtime.service.shutil.which",
+        return_value=None,
+    ):
+        assert service._validate_mcp_command() == str(node.resolve())
+
+
+def test_validate_mcp_command_reports_missing_configured_command() -> None:
+    service = _make_service()
+    service.mcp_cfg.params["command"] = "missing-playwright-command"
+
+    with patch(
+        "openjiuwen.harness.tools.browser_move.playwright_runtime.service.shutil.which",
+        return_value=None,
+    ), pytest.raises(RuntimeError, match="missing-playwright-command.*not found in PATH"):
+        service._validate_mcp_command()
 
 
 def test_build_managed_profile_defaults_user_data_dir_to_runtime_workspace() -> None:
