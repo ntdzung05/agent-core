@@ -127,19 +127,36 @@ class WorkspaceAssembler:
         member_name: str,
         member_desc: str | None = None,
         member_prompt: str | None = None,
-    ) -> None:
-        """Write B-class member identity files at member spawn time.
+    ) -> tuple[str | None, str | None]:
+        """Write/protect B-class md, prime cache, return bodies.
 
-        ``card.md`` (body = desc only) + ``member_prompt.md``, values from the
-        member's DB row (ctx.desc / ctx.prompt). ``display_name`` never rides
-        the file. The final file state (body *and* ``updated_at``) is primed
-        into the shared cache so the read side does not re-read the file.
+        The caller (``spawn_member`` / ``_assemble_member_workspace``) is
+        responsible for ensuring the member workspace root exists first via
+        ``prepare_member_workspace``; this method only writes ``card.md`` /
+        ``member_prompt.md`` through that path and primes the shared cache. It
+        never creates the workspace directory itself, so it cannot race the
+        binder's link creation. ``card.md`` (body = desc only) +
+        ``member_prompt.md``, values from the member's DB row (ctx.desc /
+        ctx.prompt). ``display_name`` never rides the file. The final file state
+        (body *and* ``updated_at``) is primed into the shared cache so the read
+        side does not re-read the file.
+
+        Returns ``(desc_body, prompt_body)`` — the evolved md body when the file
+        was already evolved (write skipped, evolution wins), the newly-written
+        baseline body when it was written, or ``None`` when the value was empty.
+        Callers (``spawn_member``) use these to write the db row with the latest
+        identity known at spawn time instead of the spec baseline, closing the
+        first-roster race where the roster is delivered before member spawn.
         """
         desc_content = self._store.write_card(team_name, member_name, member_desc)
         prompt_content = self._store.write_member_prompt(team_name, member_name, member_prompt)
         if self._cache is not None:
             self._cache.fill_member_field(member_name, "desc", desc_content)
             self._cache.fill_member_field(member_name, "prompt", prompt_content)
+        return (
+            desc_content.body if desc_content is not None else None,
+            prompt_content.body if prompt_content is not None else None,
+        )
 
     # ── write-side cache priming ──────────────────────────────────────────
     #
