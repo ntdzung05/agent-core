@@ -37,8 +37,7 @@ _CANCEL_PARAMS: Dict[str, Any] = {
 }
 
 _CLEAR_CANCEL_DESC = (
-    "Clear the cancellation flag for a browser session or request. "
-    "Returns JSON with ok/session_id/request_id/error."
+    "Clear the cancellation flag for a browser session or request. Returns JSON with ok/session_id/request_id/error."
 )
 _CLEAR_CANCEL_PARAMS: Dict[str, Any] = {
     "type": "object",
@@ -72,19 +71,14 @@ _CUSTOM_ACTION_PARAMS: Dict[str, Any] = {
     "required": ["action"],
 }
 
-_LIST_ACTIONS_DESC = (
-    "List available custom browser actions and detailed parameter guidance "
-    "for browser_custom_action."
-)
+_LIST_ACTIONS_DESC = "List available custom browser actions and detailed parameter guidance for browser_custom_action."
 _LIST_ACTIONS_PARAMS: Dict[str, Any] = {
     "type": "object",
     "properties": {},
     "required": [],
 }
 
-_RUNTIME_HEALTH_DESC = (
-    "Return runtime readiness, heartbeat status, and selected provider/model configuration."
-)
+_RUNTIME_HEALTH_DESC = "Return runtime readiness, heartbeat status, and selected provider/model configuration."
 _RUNTIME_HEALTH_PARAMS: Dict[str, Any] = {
     "type": "object",
     "properties": {},
@@ -102,8 +96,10 @@ _PROBE_INTERACTIVES_DESC = (
     "is needed. For product/search/listing card data, prefer browser_probe_cards first. "
     "The result includes compact PageState and generation-scoped target_id values that can be "
     "passed directly to browser_batch_interact without rebuilding CSS. It also includes "
-    "role/text/region/kind plus match_count/visible/enabled/actionable. The model-facing "
-    "result does not expose Probe-local ids or internal selectors."
+    "role/text/region/kind, compact browser-computed ax role/name/state/value semantics, and "
+    "match_count/visible/enabled/actionable/clickable. The model-facing result does not expose "
+    "Probe-local ids or internal selectors. The top-level ax_enrichment diagnostic reports "
+    "complete, partial, or unavailable."
 )
 _PROBE_INTERACTIVES_PARAMS: Dict[str, Any] = {
     "type": "object",

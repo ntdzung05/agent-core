@@ -20,6 +20,11 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+    DEFAULT_BROWSER_CAPABILITIES,
+    resolve_browser_capabilities,
+)
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
     BrowserStateContextProcessorConfig,
 )
@@ -29,17 +34,12 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_co
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
     BrowserWorkingContextRail,
 )
-from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
     RuntimeSettings,
     build_browser_guardrails,
     build_playwright_mcp_config,
     build_runtime_settings,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
-    DEFAULT_BROWSER_CAPABILITIES,
-    resolve_browser_capabilities,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserAgentRuntime,
@@ -63,8 +63,7 @@ if TYPE_CHECKING:
 
 BROWSER_AGENT_FACTORY_NAME = "browser_agent"
 # Agent checkpoints are namespaced by AgentCard.id inside a conversation.
-# Keep the default stable so reconstructing this subagent can restore its
-# Session-backed working context on a same-conversation follow-up.
+# Keep the default stable across same-conversation subagent reconstruction.
 BROWSER_AGENT_CARD_ID = "openjiuwen.browser_agent"
 DEFAULT_BROWSER_AGENT_TEMPERATURE = 0.4
 DEFAULT_BROWSER_AGENT_MAX_ITERATIONS = 100
@@ -86,6 +85,10 @@ DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT_EN = (
     "Before acting, classify the task as a simple lookup or a complex workflow and keep a compact "
     "phase plan. For a simple lookup, prefer a direct search-results URL when the search engine and "
     "query are known, unless operating the search form is itself the requested outcome. "
+    "Treat all tool calls emitted in one response as one semantic action batch. Before executing a "
+    "batch, declare one intent and observable expected outcome for the whole batch. When a previous "
+    "batch awaits assessment, assess it once from browser or tool evidence before executing another "
+    "batch or finishing; never assess individual tool calls. "
     "For a complex form, group deterministic field, date, filter, and submit operations into "
     "browser_batch_interact and end the batch with wait_for_selector, wait_for_text, or "
     "wait_for_load_state. For dynamic pages, use wait_for_url, wait_for_first_card_title, "
@@ -153,6 +156,8 @@ DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT_CN = (
     "执行前先将任务判断为简单查询或复杂流程，并维护紧凑的阶段计划。"
     "简单查询在已知搜索引擎和关键词时，优先直接构造搜索结果 URL；"
     "只有当操作搜索表单本身就是任务目标时才逐项操作搜索框。"
+    "同一响应中的全部工具调用视为一个语义动作批次。执行批次前，只为整个批次声明一次意图和可观察的预期结果。"
+    "上一批次等待评估时，必须根据浏览器或工具证据整体评估一次，再执行新批次或结束；不得逐个工具调用评估。"
     "复杂表单应将确定的字段、日期、筛选和提交操作合并到 browser_batch_interact，"
     "并在 batch 末尾使用 wait_for_selector、wait_for_text 或 wait_for_load_state。"
     "优先等待可观察条件，不要使用 sleep、wait_after_ms 或固定 wait_after_each_ms。"

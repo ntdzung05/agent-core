@@ -4,7 +4,31 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
+
+import yaml
+
+_AX_STATE_KEYS = frozenset(
+    {
+        "active",
+        "checked",
+        "disabled",
+        "expanded",
+        "invalid",
+        "level",
+        "pressed",
+        "readonly",
+        "required",
+        "selected",
+    }
+)
+_AX_YAML_ROOT_RE = re.compile(
+    r"^(?P<role>[A-Za-z][\w-]*)"
+    r'(?:\s+"(?P<name>(?:[^"\\]|\\.)*)")?'
+    r"(?P<attributes>(?:\s+\[[^\]]+\])*)$"
+)
+_AX_YAML_ATTRIBUTE_RE = re.compile(r"\[(?P<key>[A-Za-z][\w-]*)(?:=(?P<value>[^\]]+))?\]")
 
 
 def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -13,6 +37,228 @@ def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _compact_probe_text(value: Any, limit: int = 140) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _normalize_ax_state_value(value: Any) -> Any:
+    if isinstance(value, (bool, int, float)):
+        return value
+    normalized = str(value or "").strip()
+    lowered = normalized.lower()
+    if lowered == "true":
+        result: Any = True
+    elif lowered == "false":
+        result = False
+    elif re.fullmatch(r"-?\d+", normalized):
+        result = int(normalized)
+    elif len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in "\"'":
+        try:
+            result = yaml.safe_load(normalized)
+        except yaml.YAMLError:
+            result = normalized[1:-1]
+    else:
+        result = normalized
+    return result
+
+
+def _first_ax_json_node(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        if value.get("role"):
+            return value
+        for child_key in ("root", "nodes", "children"):
+            node = _first_ax_json_node(value.get(child_key))
+            if node is not None:
+                return node
+        return None
+    if isinstance(value, list):
+        for child in value:
+            node = _first_ax_json_node(child)
+            if node is not None:
+                return node
+    return None
+
+
+def _parse_ax_yaml_root(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = yaml.safe_load(value)
+    except yaml.YAMLError:
+        parsed = None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+
+    root = parsed[0]
+    root_value: Any = None
+    if isinstance(root, str):
+        descriptor = root
+    elif isinstance(root, dict) and root:
+        descriptor, root_value = next(iter(root.items()))
+    else:
+        return None
+
+    match = _AX_YAML_ROOT_RE.fullmatch(str(descriptor).strip())
+    if match is None:
+        return None
+
+    raw_name = match.group("name") or ""
+    if raw_name:
+        try:
+            name = str(yaml.safe_load(f'"{raw_name}"') or "")
+        except yaml.YAMLError:
+            name = raw_name
+    else:
+        name = ""
+
+    states: Dict[str, Any] = {}
+    for state_match in _AX_YAML_ATTRIBUTE_RE.finditer(match.group("attributes") or ""):
+        key = state_match.group("key")
+        if key not in _AX_STATE_KEYS:
+            continue
+        raw_state_value = state_match.group("value")
+        states[key] = True if raw_state_value is None else _normalize_ax_state_value(raw_state_value)
+
+    result: Dict[str, Any] = {
+        "role": match.group("role"),
+        "name": name,
+        "states": states,
+    }
+    if root_value is not None and not isinstance(root_value, (dict, list)):
+        result["value"] = root_value
+    return result
+
+
+def _normalize_ax_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, str):
+        return _parse_ax_yaml_root(value)
+
+    node = _first_ax_json_node(value)
+    if node is None:
+        return None
+
+    states = {
+        key: _normalize_ax_state_value(node[key]) for key in _AX_STATE_KEYS if key in node and node[key] is not None
+    }
+    normalized: Dict[str, Any] = {
+        "role": _compact_probe_text(node.get("role"), 60),
+        "name": _compact_probe_text(node.get("name")),
+        "states": states,
+    }
+    if "value" in node:
+        normalized["value"] = node.get("value")
+    return normalized
+
+
+def _refine_action_likelihood(item: Dict[str, Any], ax: Dict[str, Any]) -> None:
+    role = str(ax.get("role") or "").lower()
+    searchable = " ".join(
+        str(value or "") for value in (role, ax.get("name"), item.get("text"), item.get("placeholder"))
+    ).lower()
+    if any(term in searchable for term in ("search", "find", "query", "keyword")):
+        item["action_likelihood"] = "search"
+    elif role in {"textbox", "searchbox", "combobox", "spinbutton"}:
+        item["action_likelihood"] = "input"
+    elif any(term in searchable for term in ("next", "pagination", "load more")):
+        item["action_likelihood"] = "pagination"
+    elif any(term in searchable for term in ("login", "sign in", "signin", "log in")):
+        item["action_likelihood"] = "login"
+    elif role:
+        item["action_likelihood"] = role
+
+
+def _existing_ax_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict) or not value.get("role"):
+        return None
+    result: Dict[str, Any] = {
+        "role": _compact_probe_text(value.get("role"), 60),
+        "name": _compact_probe_text(value.get("name")),
+        "states": dict(value.get("states") or {}),
+    }
+    if "value" in value:
+        result["value"] = value.get("value")
+    return result
+
+
+def _merge_dom_ax_properties(ax: Dict[str, Any], dom_ax: Any) -> Dict[str, Any]:
+    states = ax.setdefault("states", {})
+    if not isinstance(dom_ax, dict):
+        return states
+    dom_states = dom_ax.get("states")
+    if isinstance(dom_states, dict):
+        for key, state_value in dom_states.items():
+            if key in _AX_STATE_KEYS and key not in states:
+                states[key] = _normalize_ax_state_value(state_value)
+    if "value" not in ax and "value" in dom_ax:
+        ax["value"] = dom_ax.get("value")
+    return states
+
+
+def _enrich_interactive_probe_item(item: Dict[str, Any]) -> bool:
+    item.pop("ref", None)
+    item.pop("__ax_selector", None)
+    dom_ax = item.pop("__dom_ax", {})
+    raw_ax_json = item.pop("__ax_json", None)
+    raw_ax_yaml = item.pop("__ax_yaml", None)
+
+    ax = _normalize_ax_payload(raw_ax_json)
+    if ax is None:
+        ax = _normalize_ax_payload(raw_ax_yaml)
+    if ax is None:
+        ax = _existing_ax_payload(item.get("ax"))
+    if ax is None:
+        item.pop("ax", None)
+        return False
+
+    states = _merge_dom_ax_properties(ax, dom_ax)
+    ax["role"] = _compact_probe_text(ax.get("role"), 60)
+    ax["name"] = _compact_probe_text(ax.get("name"))
+    if "value" in ax:
+        ax["value"] = _compact_probe_text(ax.get("value"))
+    if not states:
+        ax.pop("states", None)
+
+    item["ax"] = ax
+    item["role"] = ax["role"]
+    item["accessible_name"] = ax["name"]
+    _refine_action_likelihood(item, ax)
+
+    if bool(states.get("disabled")):
+        item["disabled"] = True
+        item["enabled"] = False
+        item["actionable"] = False
+        item["clickable"] = False
+        item["selector_hint"] = ""
+        item["selector_hint_validated"] = False
+    return True
+
+
+def enrich_interactive_probe_payload(payload: Dict[str, Any]) -> None:
+    """Normalize private Playwright AX results into the public compact probe schema."""
+
+    elements = payload.get("elements")
+    if not isinstance(elements, list):
+        elements = []
+        payload["elements"] = elements
+
+    enriched = sum(1 for item in elements if isinstance(item, dict) and _enrich_interactive_probe_item(item))
+
+    attempted = len(elements)
+    failed = max(0, attempted - enriched)
+    if attempted == 0 or failed == 0:
+        status = "complete"
+    elif enriched:
+        status = "partial"
+    else:
+        status = "unavailable"
+    payload["ax_enrichment"] = {
+        "status": status,
+        "attempted": attempted,
+        "enriched": enriched,
+        "failed": failed,
+    }
 
 
 def build_browser_state_metadata_js() -> str:
@@ -222,7 +468,7 @@ def build_interactive_probe_js(
 async (page) => {{
   const params = {params_json};
 
-  return await page.evaluate((params) => {{
+  const payload = await page.evaluate((params) => {{
     const maxItems = Math.max(1, Math.min(Number(params.max_items || 50), 100));
     const viewportOnly = params.viewport_only !== false;
     const query = String(params.query || '').trim().toLowerCase();
@@ -443,8 +689,22 @@ async (page) => {{
     }};
 
     const accessibleName = (el) => {{
+      const labelledBy = String(el.getAttribute('aria-labelledby') || '')
+        .split(/\\s+/)
+        .filter(Boolean)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((label) => label.innerText || label.textContent || '')
+        .join(' ');
+      const associatedLabels = el.labels
+        ? Array.from(el.labels)
+          .map((label) => label.innerText || label.textContent || '')
+          .join(' ')
+        : '';
       return normalize(
+        labelledBy ||
         el.getAttribute('aria-label') ||
+        associatedLabels ||
         el.getAttribute('title') ||
         el.getAttribute('placeholder') ||
         el.getAttribute('alt') ||
@@ -547,6 +807,51 @@ async (page) => {{
       if (role === 'tab') return 'tab';
       if (role === 'option') return 'option';
       return '';
+    }};
+
+    const domAxProperties = (el) => {{
+      const states = {{}};
+      const tag = el.tagName.toLowerCase();
+      const role = roleFromTag(el);
+      const ariaState = (name) => {{
+        if (!el.hasAttribute(name)) return undefined;
+        const value = String(el.getAttribute(name) || '').trim().toLowerCase();
+        if (value === 'true') return true;
+        if (value === 'false') return false;
+        return value || true;
+      }};
+
+      const expanded = ariaState('aria-expanded');
+      if (expanded !== undefined) states.expanded = expanded;
+      const pressed = ariaState('aria-pressed');
+      if (pressed !== undefined) states.pressed = pressed;
+      const ariaChecked = ariaState('aria-checked');
+      if (ariaChecked !== undefined) {{
+        states.checked = ariaChecked;
+      }} else if (tag === 'input' && ['checkbox', 'radio'].includes(String(el.type || '').toLowerCase())) {{
+        states.checked = el.indeterminate ? 'mixed' : Boolean(el.checked);
+      }}
+      const ariaSelected = ariaState('aria-selected');
+      if (ariaSelected !== undefined) {{
+        states.selected = ariaSelected;
+      }} else if (tag === 'option') {{
+        states.selected = Boolean(el.selected);
+      }}
+
+      if (Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true') states.disabled = true;
+      if (Boolean(el.required) || el.getAttribute('aria-required') === 'true') states.required = true;
+      if (Boolean(el.readOnly) || el.getAttribute('aria-readonly') === 'true') states.readonly = true;
+
+      const invalid = ariaState('aria-invalid');
+      if (invalid !== undefined && invalid !== false) states.invalid = invalid;
+      const level = el.getAttribute('aria-level');
+      if (level && /^\\d+$/.test(level)) states.level = Number(level);
+
+      const result = {{ states }};
+      if (['input', 'select', 'textarea'].includes(tag) || role === 'textbox' || role === 'combobox') {{
+        result.value = normalize(el.value || '', 140);
+      }}
+      return result;
     }};
 
     const queryAliases = (value) => {{
@@ -741,6 +1046,8 @@ async (page) => {{
         ],
         selector_hint: clickable ? selectorHint : '',
         selector_hint_validated: clickable,
+        __ax_selector: selectorHint && matchCount === 1 ? selectorHint : '',
+        __dom_ax: domAxProperties(el),
         score: scoreElement(el, rect, text, name, actionLikelihood)
       }};
       (exactMatch ? candidates : widenedCandidates).push(candidate);
@@ -780,6 +1087,41 @@ async (page) => {{
       error: null
     }};
   }}, params);
+
+  const elements = Array.isArray(payload.elements) ? payload.elements : [];
+  let cursor = 0;
+  const enrichOne = async (item) => {{
+    const selector = String(item.__ax_selector || '');
+    if (!selector) return;
+    const locator = page.locator(selector);
+    try {{
+      if (typeof locator.ariaSnapshotJSON === 'function') {{
+        item.__ax_json = await locator.ariaSnapshotJSON({{
+          mode: 'default',
+          depth: 0,
+          timeout: 500
+        }});
+      }} else if (typeof locator.ariaSnapshot === 'function') {{
+        item.__ax_yaml = await locator.ariaSnapshot({{
+          mode: 'default',
+          depth: 0,
+          timeout: 500
+        }});
+      }}
+    }} catch (_error) {{
+      // AX enrichment is best-effort; the validated DOM result remains usable.
+    }}
+  }};
+  const worker = async () => {{
+    while (cursor < elements.length) {{
+      const index = cursor;
+      cursor += 1;
+      await enrichOne(elements[index]);
+    }}
+  }};
+  const workerCount = Math.min(8, elements.length);
+  await Promise.all(Array.from({{ length: workerCount }}, () => worker()));
+  return payload;
 }}
 """.strip()
 

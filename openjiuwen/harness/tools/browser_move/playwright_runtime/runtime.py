@@ -29,6 +29,7 @@ from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRa
 from openjiuwen.harness.rails._multimodal import (
     should_enable_read_image_multimodal,
 )
+
 from ..controllers import ActionController, BaseController, validate_batch_steps
 from ..utils.parsing import extract_json_object
 from .browser_capabilities import (
@@ -46,13 +47,14 @@ from .browser_working_context import (
     latest_browser_user_request,
 )
 from .config import BrowserInstanceConfig, BrowserRunGuardrails
+from .page_state import CARD_EVIDENCE_FIELDS, BrowserPageState, BrowserTarget
+from .probe_semantics import normalize_card_probe_payload
 from .probes import (
     build_browser_state_metadata_js,
     build_card_probe_js,
     build_interactive_probe_js,
+    enrich_interactive_probe_payload,
 )
-from .page_state import CARD_EVIDENCE_FIELDS, BrowserPageState, BrowserTarget
-from .probe_semantics import normalize_card_probe_payload
 from .semantic_state import SemanticStateTracker, price_interval_signature
 from .service import MAX_ITERATION_MESSAGE, BrowserService, BrowserTaskProgressState
 from .site_profiles import (
@@ -61,7 +63,6 @@ from .site_profiles import (
     site_profiles_for_url,
 )
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
-
 
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
@@ -1757,6 +1758,7 @@ class BrowserAgentRuntime:
         parsed.setdefault("ok", True)
         parsed.setdefault("error", None)
         parsed.setdefault("elements", [])
+        enrich_interactive_probe_payload(parsed)
         self._observe_page_url(parsed.get("url"))
         self._annotate_probe_generation(parsed)
         page_state = self._ensure_page_state()
@@ -1770,6 +1772,7 @@ class BrowserAgentRuntime:
             "generation_id": exported["generation_id"],
             "count": len(exported["interactives"]),
             "elements": exported["interactives"],
+            "ax_enrichment": parsed["ax_enrichment"],
             "page_state": exported,
             "diagnostics": {
                 "query": str(query or "")[:160],
@@ -2342,9 +2345,7 @@ class BrowserRuntimeRail(AgentRail):
             "missing_fields": missing[:32],
             "missing_slots": missing_slots[:12],
             "requested_slots": [
-                dict(slot)
-                for slot in (state.get("required_evidence_slots") or [])[:12]
-                if isinstance(slot, dict)
+                dict(slot) for slot in (state.get("required_evidence_slots") or [])[:12] if isinstance(slot, dict)
             ],
             "blockers": blockers[:10],
             "field_coverage": list(state.get("field_coverage") or [])[:32],
@@ -2377,7 +2378,8 @@ class BrowserRuntimeRail(AgentRail):
                 requirements
                 or state.get("structured_evidence")
                 or state.get("evidence_slots")
-                or state.get("terminal_reason") in {
+                or state.get("terminal_reason")
+                in {
                     "model_provider_unavailable",
                     "model_tool_protocol_error",
                     "runtime_completion_requirements_missing",
@@ -3168,9 +3170,7 @@ class BrowserRuntimeRail(AgentRail):
         state["resume_count"] = int(state.get("resume_count") or 0) + 1
         state["resume_instruction"] = resume_instruction[:2_000]
         state["status"] = "in_progress"
-        state["next_action_class"] = (
-            "collect_missing_evidence" if missing else "materially_different_strategy"
-        )
+        state["next_action_class"] = "collect_missing_evidence" if missing else "materially_different_strategy"
         state["terminal_reason"] = ""
         state.pop(_BROWSER_TERMINAL_SYNTHESIS_KEY, None)
         state["replan_required"] = False
@@ -3311,9 +3311,7 @@ class BrowserRuntimeRail(AgentRail):
             token in normalized for token in ("comprehensive", "relevance", "综合", "默认排序")
         )
         latest_requested = any(token in normalized for token in ("latest", "newest", "最新", "最近发布"))
-        split_title_variants = bool(
-            "title" in required_fields and comprehensive_requested and latest_requested
-        )
+        split_title_variants = bool("title" in required_fields and comprehensive_requested and latest_requested)
         slots = [
             {"entity": entity, "variant": "default", "field": field_name}
             for field_name in required_fields
@@ -3418,11 +3416,7 @@ class BrowserRuntimeRail(AgentRail):
         filter_terms_present = _contains_any_token(serialized, filter_terms)
         script_tool = any(token in name for token in ("evaluate", "run_code"))
         filter_intent = bool(
-            filter_terms_present
-            and (
-                not script_tool
-                or cls._operation_intent(name, args) == "script_mutation"
-            )
+            filter_terms_present and (not script_tool or cls._operation_intent(name, args) == "script_mutation")
         )
         if "browser_batch_interact" in name:
             steps = args.get("steps")
@@ -3984,15 +3978,18 @@ class BrowserRuntimeRail(AgentRail):
         steps = args.get("steps")
         if not isinstance(steps, list) or not steps:
             return False
-        read_only_ops = _BATCH_SAFE_READ_SELECTOR_OPS | _BATCH_EXPLICIT_SELECTOR_OPS | {
-            "wait_for_text",
-            "wait_for_load_state",
-            "wait_for_url",
-            "wait_for_tab",
-        }
+        read_only_ops = (
+            _BATCH_SAFE_READ_SELECTOR_OPS
+            | _BATCH_EXPLICIT_SELECTOR_OPS
+            | {
+                "wait_for_text",
+                "wait_for_load_state",
+                "wait_for_url",
+                "wait_for_tab",
+            }
+        )
         return all(
-            isinstance(step, dict) and str(step.get("op") or "").strip().lower() in read_only_ops
-            for step in steps
+            isinstance(step, dict) and str(step.get("op") or "").strip().lower() in read_only_ops for step in steps
         )
 
     @staticmethod
@@ -4639,7 +4636,7 @@ class BrowserRuntimeRail(AgentRail):
         details["completion_evidence"] = completion_evidence[:300]
         phase_order = list(phases)
         try:
-            remaining_phases = phase_order[phase_order.index(phase) + 1:]
+            remaining_phases = phase_order[phase_order.index(phase) + 1 :]
         except ValueError:
             remaining_phases = []
         next_phase = next(

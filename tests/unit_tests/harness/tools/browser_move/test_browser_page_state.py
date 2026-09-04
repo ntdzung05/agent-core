@@ -99,6 +99,64 @@ def test_probe_targets_and_compact_page_state_share_one_contract() -> None:
     assert resolved.locator == {"selector": "#query"}
 
 
+def test_repeated_probe_refreshes_ax_state_without_changing_target_id() -> None:
+    state = BrowserPageState(page_id="page-ax-state")
+    first = _interactive("#country", "Country")
+    first.update(
+        {
+            "role": "combobox",
+            "accessible_name": "Country",
+            "ax": {
+                "role": "combobox",
+                "name": "Country",
+                "states": {"expanded": False, "required": True},
+                "value": "",
+            },
+        }
+    )
+    state.register_interactives({"elements": [first]})
+    first_target_id = first["target_id"]
+
+    second = _interactive("#country", "Singapore")
+    second.update(
+        {
+            "role": "combobox",
+            "accessible_name": "Country",
+            "ax": {
+                "role": "combobox",
+                "name": "Country",
+                "states": {"expanded": True, "required": True},
+                "value": "Singapore",
+            },
+        }
+    )
+    state.register_interactives({"elements": [second]})
+
+    assert second["target_id"] == first_target_id
+    assert state.export()["interactives"] == [
+        {
+            "target_id": first_target_id,
+            "generation_id": "g0",
+            "role": "combobox",
+            "text": "Singapore",
+            "ax": {
+                "role": "combobox",
+                "name": "Country",
+                "states": {"expanded": True, "required": True},
+                "value": "Singapore",
+            },
+            "match_count": 1,
+            "visible": True,
+            "enabled": True,
+            "actionable": True,
+            "clickable": True,
+        }
+    ]
+    resolved = state.resolve_target(generation_id="g0", target_id=first_target_id)
+    assert resolved is not None
+    assert resolved.ax["states"]["expanded"] is True
+
+
 def test_cards_add_primary_link_and_field_coverage_to_page_state() -> None:
     state = BrowserPageState(page_id="page-results", generation=4)
     payload = {

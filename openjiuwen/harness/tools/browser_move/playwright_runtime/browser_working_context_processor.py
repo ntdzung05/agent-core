@@ -17,7 +17,6 @@ from .browser_working_context import (
     BrowserWorkingContextStore,
 )
 
-
 _BROWSER_WORKING_CONTEXT_MESSAGE_NAME = "browser_working_context"
 _BROWSER_WORKING_CONTEXT_METADATA_KEY = "browser_working_context"
 _BROWSER_WORKING_CONTEXT_MESSAGE_ID = "openjiuwen:browser-working-context"
@@ -54,7 +53,7 @@ class BrowserWorkingContextProcessor(ContextProcessor):
         store = BrowserWorkingContextStore(self.config)
         session = context.get_session_ref() if context is not None else None
         if context is not None:
-            store.commit_pending_from_messages(session, context.get_messages())
+            store.prepare_for_model_call(session, context.get_messages())
 
         prompt_text = store.render_and_consume_one_step(session)
         retained_messages = [
@@ -84,10 +83,7 @@ class BrowserWorkingContextProcessor(ContextProcessor):
         if message.name in {"current_browser_state", "browser_state_progress"}:
             return True
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
-        return bool(
-            metadata.get("browser_state_context")
-            or metadata.get("browser_state_progress_context")
-        )
+        return bool(metadata.get("browser_state_context") or metadata.get("browser_state_progress_context"))
 
     @staticmethod
     def _is_working_context_message(message: BaseMessage) -> bool:

@@ -142,6 +142,8 @@ Returns up to `max_items` visible interactive elements, ranked by a heuristic sc
 
 **Result**: `{ok, url, title, viewport, elements: [...]}` where each element carries `id`, `tag`, `role`, `action_likelihood` (`search` / `input` / `pagination` / `login` / `filter` / `commerce` / `button` / `link`), visible `text`, `accessible_name`, `aria_label`, `testid`, `placeholder`, `href`, `disabled`, `bbox`, and `selector_hint` (prefers `data-testid` → `#id` → attribute selectors → an `nth-of-type` path).
 
+When available, each element also has an `ax` object containing Playwright-computed `role` and accessible `name`, applicable states such as `checked`, `disabled`, `expanded`, `invalid`, `pressed`, and `selected`, plus the live form `value`. This enrichment is deterministic and runs inside the same run-code call; it does not take a full-page snapshot or return native Playwright refs. The top-level `ax_enrichment` object reports `complete`, `partial`, or `unavailable` without failing an otherwise usable DOM probe.
+
 #### tool browser_probe_cards
 
 Detects repeated card/listing structures — product grids, search results, catalogs, article lists — and extracts structured fields per card. Use it **first** on any page with repeated visible cards or listing rows; if it returns the fields the task needs, use them directly instead of screenshots or broad DOM evaluation.

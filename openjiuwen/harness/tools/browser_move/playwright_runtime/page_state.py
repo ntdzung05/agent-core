@@ -11,7 +11,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-
 _AX_REF_LINE_RE = re.compile(
     r"^\s*-\s+(?P<role>[A-Za-z][\w-]*)"
     r'(?:\s+"(?P<name>[^"]*)")?.*?\[ref=(?P<ref>[A-Za-z0-9_.:-]+)\]',
@@ -82,6 +81,27 @@ def _compact_text(value: Any, limit: int = 120) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+def _compact_ax(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: Dict[str, Any] = {}
+    role = _compact_text(value.get("role"), 60)
+    name = _compact_text(value.get("name"), 120)
+    if role:
+        result["role"] = role
+    result["name"] = name
+    states = value.get("states")
+    if isinstance(states, Mapping):
+        result["states"] = {
+            str(key): state_value for key, state_value in list(states.items())[:10] if state_value is not None
+        }
+        if not result["states"]:
+            result.pop("states")
+    if "value" in value:
+        result["value"] = _compact_text(value.get("value"), 120)
+    return result if role else {}
+
+
 def _generation_number(generation_id: str) -> int:
     normalized = str(generation_id or "").strip().lower()
     if not re.fullmatch(r"g\d+", normalized):
@@ -106,6 +126,7 @@ class BrowserTarget:
     text: str = ""
     region: str = ""
     kind: str = ""
+    ax: Dict[str, Any] = field(default_factory=dict)
     visible: bool = True
     enabled: bool = True
     actionable: bool = False
@@ -134,6 +155,8 @@ class BrowserTarget:
             result["region"] = self.region
         if self.kind:
             result["kind"] = self.kind
+        if self.ax:
+            result["ax"] = _compact_ax(self.ax)
         if self.field_name:
             result["field"] = self.field_name
         result["match_count"] = 1
@@ -611,7 +634,11 @@ class BrowserPageState:
         if selector:
             existing_id = self._selector_targets.get((self.generation, selector))
             if existing_id and existing_id in self._targets:
-                return self._targets[existing_id]
+                target = self._targets[existing_id]
+                self._refresh_probe_target(target, item=item, source=source, href=href)
+                return target
+
+        ax = _compact_ax(item.get("ax"))
 
         target = self._new_target(
             source=source,
@@ -623,6 +650,7 @@ class BrowserPageState:
             text=str(item.get("text") or item.get("title") or "").strip(),
             region=str(item.get("region") or "").strip(),
             kind=str(item.get("kind") or "").strip(),
+            ax=ax,
             visible=bool(item.get("visible", True)),
             enabled=bool(item.get("enabled", not item.get("disabled", False))),
             actionable=bool(item.get("actionable", False)),
@@ -632,6 +660,28 @@ class BrowserPageState:
             self.selector_generations[selector] = self.generation
             self._selector_targets[(self.generation, selector)] = target.target_id
         return target
+
+    @staticmethod
+    def _refresh_probe_target(
+        target: BrowserTarget,
+        *,
+        item: Mapping[str, Any],
+        source: str,
+        href: str,
+    ) -> None:
+        """Refresh mutable semantics while preserving a selector target's identity."""
+        target.source = source
+        target.href = href
+        target.role = str(item.get("role") or "").strip()
+        target.name = str(item.get("accessible_name") or item.get("name") or "").strip()
+        target.text = str(item.get("text") or item.get("title") or "").strip()
+        target.region = str(item.get("region") or "").strip()
+        target.kind = str(item.get("kind") or "").strip()
+        target.ax = _compact_ax(item.get("ax"))
+        target.visible = bool(item.get("visible", True))
+        target.enabled = bool(item.get("enabled", not item.get("disabled", False)))
+        target.actionable = bool(item.get("actionable", False))
+        target.clickable = bool(item.get("clickable", False))
 
     def _register_primary_link_target(
         self,

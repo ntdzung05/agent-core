@@ -23,18 +23,18 @@ from openjiuwen.harness.subagents.browser_agent import (
     build_browser_agent_config,
     create_browser_agent,
 )
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+    CORE_BROWSER_TOOL_NAMES,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+    BrowserWorkingContextRail,
+)
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserRunGuardrails,
     RuntimeSettings,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
-    CORE_BROWSER_TOOL_NAMES,
-)
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserRuntimeRail,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
-    BrowserWorkingContextRail,
 )
 
 
@@ -178,12 +178,22 @@ def test_browser_agent_prompt_enforces_convergent_browser_strategy() -> None:
     assert "one runtime-maintained <browser_working_context>" in english
     assert "A fresh browser capture occurs initially" in english
     assert "runtime directive requires replanning" in english
+    assert "one semantic action batch" in english
+    assert "declare one intent and observable expected outcome" in english
+    assert "When a previous batch awaits assessment" in english
+    assert "before executing another batch or finishing" in english
+    assert "never assess individual tool calls" in english
     assert "直接构造搜索结果 URL" in chinese
     assert "可观察条件" in chinese
     assert "直接导航该 URL" in chinese
     assert "立即结束" in chinese
     assert "<browser_working_context>" in chinese
     assert "runtime 要求重新规划" in chinese
+    assert "一个语义动作批次" in chinese
+    assert "只为整个批次声明一次意图和可观察的预期结果" in chinese
+    assert "上一批次等待评估时" in chinese
+    assert "再执行新批次或结束" in chinese
+    assert "不得逐个工具调用评估" in chinese
     assert "browser_run_code_unsafe" not in english
     assert "browser_run_code_unsafe" not in chinese
     assert "makes a browser_run_code tool visible" in english
@@ -312,7 +322,7 @@ def test_default_wiring_does_not_pre_register_playwright_mcp_on_subagent() -> No
     assert settings.mcp_cfg not in calls[0]["mcps"]
 
 
-def test_default_wiring_main_agent_has_browser_runtime_rail() -> None:
+def test_default_wiring_has_runtime_and_durable_context_rails() -> None:
     calls, fake = _capture_create_deep_agent()
     with _patch_all(fake)[0]:
         create_browser_agent(_fake_model(), settings=_fake_settings())
@@ -344,7 +354,8 @@ def test_default_wiring_adds_browser_state_and_windows_large_tool_results() -> N
         "browser_evaluate",
     ]
     assert config.keep_last_k == 1
-    assert processor_map["BrowserWorkingContextProcessor"].max_recent_steps > 0
+    assert processor_map["BrowserWorkingContextProcessor"].max_recent_steps == 2
+    assert processor_map["BrowserWorkingContextProcessor"].max_prompt_chars == 8_000
     assert processor_map["BrowserStateContextProcessor"].provider is not None
     assert config.trim_size == 1000
     assert config.min_offload_chars == 4096
@@ -396,10 +407,7 @@ def test_default_wiring_adds_scoped_offload_recall_without_filesystem_tools() ->
     with _patch_all(fake)[0]:
         create_browser_agent(_fake_model(), settings=_fake_settings())
 
-    tool_names = [
-        getattr(getattr(tool, "card", None), "name", None)
-        for tool in calls[0].get("tools", [])
-    ]
+    tool_names = [getattr(getattr(tool, "card", None), "name", None) for tool in calls[0].get("tools", [])]
     assert "browser_recall_offload" in tool_names
     assert "read_file" not in tool_names
     assert "bash" not in tool_names
@@ -498,6 +506,30 @@ def test_language_cn_uses_chinese_prompt() -> None:
         create_browser_agent(_fake_model(), language="cn", settings=_fake_settings())
 
     assert calls[0]["system_prompt"] == DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT["cn"]
+
+
+def test_custom_prompt_is_forwarded_unchanged() -> None:
+    calls, fake = _capture_create_deep_agent()
+    with _patch_all(fake)[0]:
+        create_browser_agent(
+            _fake_model(),
+            system_prompt="Custom browser instructions.",
+            language="en",
+            settings=_fake_settings(),
+        )
+
+    assert calls[0]["system_prompt"] == "Custom browser instructions."
+
+
+def test_custom_config_prompt_is_forwarded_unchanged() -> None:
+    spec = build_browser_agent_config(
+        _fake_model(),
+        system_prompt="Custom browser instructions.",
+        language="en",
+        settings=_fake_settings(),
+    )
+
+    assert spec.system_prompt == "Custom browser instructions."
 
 
 def test_user_tools_are_merged_with_browser_tools() -> None:

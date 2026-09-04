@@ -10,21 +10,22 @@ from unittest.mock import AsyncMock
 
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.core.runner import Runner
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
     CORE_BROWSER_TOOL_NAMES,
 )
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
 from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
     build_interactive_probe_js,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
-    builtin_site_profiles,
+    enrich_interactive_probe_payload,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserAgentRuntime,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
     BrowserProbeInteractivesTool,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    builtin_site_profiles,
 )
 
 
@@ -95,6 +96,13 @@ def test_build_interactive_probe_js_contains_high_value_selectors() -> None:
     assert "kind: kind || actionLikelihood" in js
     assert "'[role=\"gridcell\"]'" in js
     assert "'[role=\"tab\"]'" in js
+    assert "ariaSnapshotJSON" in js
+    assert "ariaSnapshot" in js
+    assert "depth: 0" in js
+    assert "timeout: 500" in js
+    assert "Math.min(8, elements.length)" in js
+    assert "browser_snapshot" not in js
+    assert "mode: 'ai'" not in js
 
 
 def test_build_interactive_probe_js_embeds_generation_id() -> None:
@@ -117,6 +125,142 @@ def test_build_interactive_probe_js_expands_search_and_input_queries() -> None:
     assert "关键词" in js
     assert 'role="searchbox"' in js
     assert "[placeholder]" in js
+    assert "aria-labelledby" in js
+    assert "el.labels" in js
+
+
+def test_enrich_interactive_probe_payload_merges_structured_ax_and_dom_state() -> None:
+    payload = {
+        "elements": [
+            {
+                "role": "textbox",
+                "accessible_name": "from",
+                "action_likelihood": "input",
+                "text": "",
+                "enabled": True,
+                "actionable": True,
+                "clickable": True,
+                "selector_hint": "#from",
+                "selector_hint_validated": True,
+                "__ax_selector": "#from",
+                "__ax_json": [
+                    {
+                        "role": "combobox",
+                        "name": "Flying from",
+                        "expanded": False,
+                    }
+                ],
+                "__dom_ax": {
+                    "states": {"required": True, "readonly": False},
+                    "value": "Singapore",
+                },
+            }
+        ]
+    }
+
+    enrich_interactive_probe_payload(payload)
+
+    element = payload["elements"][0]
+    assert element["role"] == "combobox"
+    assert element["accessible_name"] == "Flying from"
+    assert element["action_likelihood"] == "input"
+    assert element["ax"] == {
+        "role": "combobox",
+        "name": "Flying from",
+        "states": {
+            "expanded": False,
+            "required": True,
+            "readonly": False,
+        },
+        "value": "Singapore",
+    }
+    assert not any(key.startswith("__") for key in element)
+    assert payload["ax_enrichment"] == {
+        "status": "complete",
+        "attempted": 1,
+        "enriched": 1,
+        "failed": 0,
+    }
+
+
+def test_enrich_interactive_probe_payload_supports_yaml_and_partial_failure() -> None:
+    payload = {
+        "elements": [
+            {
+                "role": "checkbox",
+                "__ax_yaml": '- checkbox "Subscribe" [checked] [disabled=false]',
+                "__dom_ax": {"states": {"required": True}},
+            },
+            {
+                "role": "button",
+                "__ax_yaml": "not: [valid",
+                "__ax_selector": "#broken",
+            },
+        ]
+    }
+
+    enrich_interactive_probe_payload(payload)
+
+    assert payload["elements"][0]["ax"] == {
+        "role": "checkbox",
+        "name": "Subscribe",
+        "states": {"checked": True, "disabled": False, "required": True},
+    }
+    assert "ax" not in payload["elements"][1]
+    assert "__ax_yaml" not in payload["elements"][1]
+    assert "__ax_selector" not in payload["elements"][1]
+    assert payload["ax_enrichment"] == {
+        "status": "partial",
+        "attempted": 2,
+        "enriched": 1,
+        "failed": 1,
+    }
+
+
+def test_enrich_interactive_probe_payload_parses_yaml_value() -> None:
+    payload = {
+        "elements": [
+            {
+                "role": "textbox",
+                "__ax_yaml": '- textbox "Email" [invalid]: not-an-email',
+            }
+        ]
+    }
+
+    enrich_interactive_probe_payload(payload)
+
+    assert payload["elements"][0]["ax"] == {
+        "role": "textbox",
+        "name": "Email",
+        "states": {"invalid": True},
+        "value": "not-an-email",
+    }
+
+
+def test_enrich_interactive_probe_payload_disables_unsafe_ax_target() -> None:
+    payload = {
+        "elements": [
+            {
+                "role": "button",
+                "enabled": True,
+                "actionable": True,
+                "clickable": True,
+                "selector_hint": "#submit",
+                "selector_hint_validated": True,
+                "__ax_json": [{"role": "button", "name": "Submit", "disabled": True}],
+            }
+        ]
+    }
+
+    enrich_interactive_probe_payload(payload)
+
+    element = payload["elements"][0]
+    assert element["disabled"] is True
+    assert element["enabled"] is False
+    assert element["actionable"] is False
+    assert element["clickable"] is False
+    assert element["selector_hint"] == ""
+    assert element["selector_hint_validated"] is False
 
 
 def test_build_interactive_probe_js_clamps_max_items() -> None:
@@ -195,6 +339,8 @@ def test_runtime_probe_interactives_uses_code_executor_and_parses_json() -> None
                     "id": "e1",
                     "role": "button",
                     "text": "Search",
+                    "region": "global_search",
+                    "kind": "search",
                     "selector_hint": "button:nth-of-type(1)",
                     "selector_hint_validated": True,
                     "match_count": 1,
@@ -202,6 +348,9 @@ def test_runtime_probe_interactives_uses_code_executor_and_parses_json() -> None
                     "enabled": True,
                     "actionable": True,
                     "clickable": True,
+                    "__ax_selector": "button:nth-of-type(1)",
+                    "__ax_json": [{"role": "button", "name": "Search the site"}],
+                    "__dom_ax": {"states": {}},
                 }
             ],
         }
@@ -220,11 +369,26 @@ def test_runtime_probe_interactives_uses_code_executor_and_parses_json() -> None
     assert result["ok"] is True
     assert result["url"] == "https://example.com"
     assert result["elements"][0]["text"] == "Search"
+    assert result["elements"][0]["region"] == "global_search"
+    assert result["elements"][0]["kind"] == "search"
+    assert result["elements"][0]["ax"] == {
+        "role": "button",
+        "name": "Search the site",
+    }
+    assert result["ax_enrichment"] == {
+        "status": "complete",
+        "attempted": 1,
+        "enriched": 1,
+        "failed": 0,
+    }
     assert result["elements"][0]["target_id"].startswith("t_g")
     assert result["elements"][0]["generation_id"] == result["page_state"]["generation_id"]
     assert "id" not in result["elements"][0]
     assert "selector_hint" not in result["elements"][0]
     assert result["page_state"]["interactives"][0]["target_id"] == result["elements"][0]["target_id"]
+    assert result["page_state"]["interactives"][0]["region"] == "global_search"
+    assert result["page_state"]["interactives"][0]["kind"] == "search"
+    assert result["page_state"]["interactives"][0]["ax"] == result["elements"][0]["ax"]
 
 
 def test_runtime_probe_interactives_handles_missing_code_executor() -> None:
@@ -237,6 +401,48 @@ def test_runtime_probe_interactives_handles_missing_code_executor() -> None:
     assert result["ok"] is False
     assert result["error"] == "browser_code_executor_not_ready"
     assert result["elements"] == []
+
+
+def test_explicit_probe_failure_preserves_previous_page_state() -> None:
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = AsyncMock(
+        side_effect=[
+            {
+                "ok": True,
+                "url": "https://example.com",
+                "title": "Example",
+                "elements": [
+                    {
+                        "role": "button",
+                        "text": "Search",
+                        "selector_hint": "#search",
+                        "selector_hint_validated": True,
+                        "match_count": 1,
+                        "visible": True,
+                        "enabled": True,
+                        "actionable": True,
+                        "clickable": True,
+                    }
+                ],
+            },
+            RuntimeError("probe timeout"),
+        ]
+    )
+
+    first = _run(runtime.probe_interactives())
+    failed = _run(runtime.probe_interactives())
+
+    target_id = first["elements"][0]["target_id"]
+    assert failed["ok"] is False
+    assert failed["page_state"]["interactives"][0]["target_id"] == target_id
+    assert (
+        runtime._ensure_page_state().resolve_target(
+            generation_id="g0",
+            target_id=target_id,
+        )
+        is not None
+    )
 
 
 def test_runtime_playwright_client_lookup_keys_include_server_name_variants() -> None:
@@ -325,7 +531,4 @@ def test_runtime_call_playwright_run_code_unsafe_uses_runner_mcp_tool(monkeypatc
     assert result["__browser_compact_rpc__"] is True
     assert result["payload"] == '{"ok":true,"elements":[]}'
     assert result["rpc_metrics"]["tool_name"] == "browser_run_code_unsafe"
-    assert (
-        result["rpc_metrics"]["transport_response_size_bytes"]
-        > result["rpc_metrics"]["response_size_bytes"]
-    )
+    assert result["rpc_metrics"]["transport_response_size_bytes"] > result["rpc_metrics"]["response_size_bytes"]
