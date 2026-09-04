@@ -78,6 +78,24 @@ STRINGS: dict[str, dict[str, str]] = {
         "reliability.escalate_user": (
             "[可靠性·严重] {summary}。已超出自动处理范围，建议立即上报控制者 / 用户决策。"
         ),
+        # reliability/external_handler.py + message.py — external runtime
+        "reliability.external_runtime_retrying": (
+            "[三方运行时] 成员 {member_name}（{agent_kind}）正在自动重试：{category}。"
+            "本轮不结束，成员状态不变，等待 SDK 后续结果。{summary}"
+        ),
+        "reliability.external_runtime_failed": (
+            "[三方运行时·失败] 成员 {member_name}（{agent_kind}，阶段 {phase}）最终失败："
+            "{category}。{summary} 原始错误：{reason_message} 建议处理：{suggested_action}。"
+            "是否需要用户介入：{user_action_required}。请评估成员状态并决定是否继续调度。"
+        ),
+        "reliability.suggested_action.auth_required": "请登录 CLI 或配置有效的 API key",
+        "reliability.suggested_action.quota_exceeded": "请检查账户额度或更换 API key",
+        "reliability.suggested_action.rate_limited": "请稍后重试",
+        "reliability.suggested_action.server_unavailable": "服务端暂时不可用，请稍后重试",
+        "reliability.suggested_action.network_timeout": "请检查网络连接和 API 地址是否可达",
+        "reliability.suggested_action.process_start_failed": "成员运行时启动失败，请检查配置或重试",
+        "reliability.suggested_action.sdk_error": "运行时异常，请重试或检查日志",
+        "reliability.suggested_action.unknown": "运行时异常，请重试或检查日志",
         # agent/dispatcher.py — member lifecycle events
         "dispatcher.member_online": "[成员事件] 成员 {target_id} 已上线",
         "dispatcher.member_restarted": "[成员事件] 成员 {target_id} 已重启 (第{restart_count}次)",
@@ -288,6 +306,50 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "swarmflow.completed": "[Swarmflow 完成] run_id={run_id}\n{result}",
         "swarmflow.failed": "[Swarmflow 失败] run_id={run_id}，错误={error}",
+        "swarmflow.budget_exhausted": (
+            "[Swarmflow 撞顶] run_id={run_id}\n"
+            "{detail}\n"
+            "触发层：{trigger_layer}（spent={spent}/{total}）。{workflow_contrast}"
+            "消耗最高的 phase：{top_phases}。{guidance}"
+        ),
+        "swarmflow.budget_exhausted.workflow_guidance": (
+            "该上限为本次工作流的单次额度（与会话总额独立），由用户设定不可改；"
+            "必须重新设计工作流以降低 token 消耗（简化流程、减少 agent、更换更省 token 的模型等）后重跑。"
+            "重跑方式：以上面的 run_id 作为 resume_id、连同改后的 script_path 一起传给 swarmflow——"
+            "未改动的 agent 调用直接复用上次的结果缓存（按其记录的 token 重新计入，不重新调用模型），"
+            "只有改动的部分重新计费，因此可原位修改脚本、保持 META name 不变，"
+            "把改动的预期消耗压回额度内即可。请重新设计工作流后，"
+            "以上面的 run_id 作为 resume_id 重试 swarmflow。"
+        ),
+        "swarmflow.budget_exhausted.session_guidance": (
+            "该预算为团队共享总额（会话级），当前已耗尽。"
+            "在未上调预算上限前，重启或新建工作流均会立即再次撞顶，"
+            "请先上调预算上限并新开会话后再重试 swarmflow。"
+        ),
+        # tool_swarmflow.py — completed-but-over-budget feedback (rail force-finish)
+        "swarmflow.budget_overrun": (
+            "[Swarmflow 超预算完成] run_id={run_id}\n"
+            "本次 run 已完成并交付结果，但消耗超出了用户设定的上限："
+            "{trigger_layer}（spent={spent}/{total}）。{workflow_contrast}"
+            "消耗最高的 phase：{top_phases}。\n"
+            "{guidance}"
+        ),
+        "swarmflow.budget_overrun.workflow_guidance": (
+            "该上限为本次工作流的单次额度（用户设定，不可改），本次 run 已违反。"
+            "若需重跑，请重新设计工作流，把预期消耗压回该额度内"
+            "（精简高消耗 phase、减少 agent 数、限制输出长度、更换更省 token 的模型）。"
+            "重跑额度规则：同名重跑=额度全新重置（已终结的 run 不结转已花额度），"
+            "且未改动的 agent 调用直接复用上次的结果缓存（不重新调用模型、不计 token），"
+            "只有改动的部分重新计费——因此可直接原位修改脚本、保持 META name 不变重跑，"
+            "把改动的预期消耗压回额度内即可；仅中断未终结的 run（崩溃/暂停/停止）"
+            "才续算剩余额度（剩余额度=上限−上次已花）。"
+            "改完后以相同 META name 再次调用 swarmflow。"
+        ),
+        "swarmflow.budget_overrun.session_guidance": (
+            "该预算为团队共享总额（会话级），当前已超限。结果已照常交付，"
+            "但在用户上调预算上限前，任何新的 swarmflow 调用都会立即撞顶——"
+            "请先向用户说明超限情况并请求上调预算（或新开会话），不要盲目重跑。"
+        ),
         # harness/async_tools.py — async background-tool framework feedback
         "async_tool.launched": (
             "[后台任务] {tool} 已启动（task_id={task_id}）。完成后结果会自动回灌给你，"
@@ -351,6 +413,27 @@ STRINGS: dict[str, dict[str, str]] = {
             "[reliability critical] {summary}. Beyond automated handling; escalate to the "
             "controller/user for a decision now."
         ),
+        # reliability/external_handler.py + message.py — external runtime
+        "reliability.external_runtime_retrying": (
+            "[external runtime] Member {member_name} ({agent_kind}) is auto-retrying: {category}. "
+            "The round stays open and member status is unchanged; awaiting the next SDK result. {summary}"
+        ),
+        "reliability.external_runtime_failed": (
+            "[external runtime failed] Member {member_name} ({agent_kind}, phase {phase}) finally "
+            "failed: {category}. {summary} Reason: {reason_message} Suggested action: {suggested_action}. "
+            "User action required: {user_action_required}. Assess the member state and decide whether "
+            "to keep scheduling it."
+        ),
+        "reliability.suggested_action.auth_required": "Log in to the CLI or configure a valid API key",
+        "reliability.suggested_action.quota_exceeded": "Check account quota or switch to a different API key",
+        "reliability.suggested_action.rate_limited": "Please retry later",
+        "reliability.suggested_action.server_unavailable": "Server temporarily unavailable; please retry later",
+        "reliability.suggested_action.network_timeout": "Check network connectivity and API endpoint reachability",
+        "reliability.suggested_action.process_start_failed": (
+            "Member runtime failed to start; check configuration or retry"
+        ),
+        "reliability.suggested_action.sdk_error": "Runtime error; retry or check logs",
+        "reliability.suggested_action.unknown": "Runtime error; retry or check logs",
         # agent/dispatcher.py — member lifecycle events
         "dispatcher.member_online": "[Member Event] Member {target_id} is online",
         "dispatcher.member_restarted": "[Member Event] Member {target_id} restarted (attempt {restart_count})",
@@ -595,6 +678,60 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "swarmflow.completed": "[Swarmflow completed] run_id={run_id}\n{result}",
         "swarmflow.failed": "[Swarmflow failed] run_id={run_id}, error={error}",
+        "swarmflow.budget_exhausted": (
+            "[Swarmflow budget exhausted] run_id={run_id}\n"
+            "{detail}\n"
+            "Triggered layer: {trigger_layer} (spent={spent}/{total}). {workflow_contrast}"
+            "Heaviest phases: {top_phases}. {guidance}"
+        ),
+        "swarmflow.budget_exhausted.workflow_guidance": (
+            "This ceiling is the run's per-run token budget (independent of the session "
+            "total), set by the user and must NOT be changed; you must redesign the "
+            "workflow to consume fewer tokens (simplify / fewer agents / cheaper "
+            "model) and relaunch. Relaunch by passing resume_id=<the run_id above> "
+            "together with the edited script_path: unchanged agent calls replay from "
+            "the prior run's result cache (re-billed from their stored tokens, no "
+            "model call) and only the changed parts bill afresh, so edit the script "
+            "in place, keep the META name, and fit the CHANGED parts' expected spend "
+            "under the ceiling. Redesign and retry swarmflow with "
+            "resume_id=<the run_id above>."
+        ),
+        "swarmflow.budget_exhausted.session_guidance": (
+            "This is the team's shared (session-wide) token ceiling and is currently "
+            "exhausted. Until the ceiling is raised, relaunching or starting a new "
+            "workflow will hit the same gate immediately — raise the ceiling and open a "
+            "new session before retrying swarmflow."
+        ),
+        # tool_swarmflow.py — completed-but-over-budget feedback (rail force-finish)
+        "swarmflow.budget_overrun": (
+            "[Swarmflow finished over budget] run_id={run_id}\n"
+            "The run completed and delivered its result, but the spend passed the "
+            "user-set ceiling: {trigger_layer} (spent={spent}/{total}). {workflow_contrast}"
+            "Heaviest phases: {top_phases}.\n"
+            "{guidance}"
+        ),
+        "swarmflow.budget_overrun.workflow_guidance": (
+            "This ceiling is the run's per-run token budget (independent of the "
+            "session total), set by the user and must NOT be changed — this run "
+            "violated it. Before relaunching, redesign the workflow so its expected "
+            "spend fits within it (trim the heaviest phases, fewer agents, shorter "
+            "outputs, a cheaper model). Relaunch budget rules: relaunching under the "
+            "SAME META name resets the ceiling (a terminal prior run carries no "
+            "spent forward) and unchanged agent calls replay from the prior run's "
+            "result cache (no model call, zero tokens) — only the changed parts are "
+            "billed again, so edit the script in place, keep the META name, and fit "
+            "the CHANGED parts' expected spend under the ceiling; only an "
+            "interrupted (non-terminal) run continues its ledger on relaunch "
+            "(remaining = ceiling − prior spent). Call swarmflow again under the "
+            "same META name once redesigned."
+        ),
+        "swarmflow.budget_overrun.session_guidance": (
+            "This is the team's shared (session-wide) token ceiling and it is now "
+            "overrun. The result was delivered as usual, but until the user raises "
+            "the ceiling, any new swarmflow call hits the same gate immediately — "
+            "explain the overrun to the user and ask for a raise (or a new session) "
+            "instead of blindly retrying."
+        ),
         # harness/async_tools.py — async background-tool framework feedback
         "async_tool.launched": (
             "[Background task] {tool} started (task_id={task_id}). The result will be "

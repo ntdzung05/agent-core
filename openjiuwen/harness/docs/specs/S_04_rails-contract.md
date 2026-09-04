@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/rails/`（61 文件，7 个子目录） |
-| 最近一次修订日期 | 2026-08-23 |
-| 关联 feature | N/A |
+| 最近一次修订日期 | 2026-09-01 |
+| 关联 feature | `F_01_ask-user-otel-events.md` |
 
 ## 范围 / 边界
 
@@ -76,6 +76,11 @@
    `self.sys_operation` / `self.workspace` 赋初值的地方。
 10. **`DeepAgentRail` 子类必然多注册两个 no-op 回调**（`_is_base_method` 拿
     `self.__class__.<m>` 与 `AgentRail.<m>` 比）；功能无害，排查回调链时可见。
+11. **ask_user 跨中断不持有 Span**：首次中断前在当前短生命周期 Span 写入
+    `ask_user.requested` OTel event，恢复并得到终态答案后在新 Span 写入
+    `ask_user.resolved`；两个 Span 均走既有生命周期正常闭合。两条事件以
+    `session_id + execution_subject_id + interaction_id` 关联，前端不得从 LLM 输出或下一次
+    请求反推 ask_user 生命周期。
 
 ## 接口契约
 

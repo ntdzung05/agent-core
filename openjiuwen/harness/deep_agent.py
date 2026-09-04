@@ -122,6 +122,7 @@ from openjiuwen.harness.prompts import (
     resolve_mode,
 )
 from openjiuwen.harness.prompts.prompt_attachment_manager import (
+    PromptAttachmentKind,
     PromptAttachmentManager,
 )
 from openjiuwen.harness.prompts.sections import SectionName
@@ -136,6 +137,7 @@ from openjiuwen.harness.resources import (
 from openjiuwen.harness.resources.extension_resolver import (
     ExtensionParts,
     ResolvedSkill,
+    ResourceKind,
     resolve_agent_template_parts,
     resolve_plugin_parts,
 )
@@ -182,6 +184,8 @@ _DEEP_EVENTS = frozenset(
 )
 
 _SUB_AGENTS_DIR = "sub_agents"
+_EXPERT_ROLE_SECTION = "expert_role"
+_EXPERT_ROLE_SOURCE = "deep_agent.agent_template"
 
 # Tools that remain visible to the model when progressive tool loading is
 # enabled.  The registration switch still decides whether a tool exists at
@@ -254,6 +258,33 @@ def _render_identity_prompt(prompt_builder: SystemPromptBuilder, language: str) 
     return identity_section.render(language)
 
 
+def _expert_role_load_content(role_name: str, language: str = "cn") -> str:
+    """Build the model-visible load notice for one expert role."""
+    if language == "en":
+        return (
+            f"The user selected the {role_name} expert. You are {role_name}. "
+            "Previous expert roles are cancelled; do not use their persona or related capabilities."
+        )
+    return (
+        f"用户选择了{role_name}专家，你是{role_name}。"
+        "此前专家角色已取消，不再使用其角色设定和相关能力。"
+    )
+
+
+def _expert_role_unload_content(role_name: str, language: str = "cn") -> str:
+    """Build the model-visible unload notice for one expert role."""
+    if language == "en":
+        return (
+            f"The user cancelled the {role_name} expert selection. Immediately stop using that "
+            "expert's role, workflows, and exclusive capabilities, and fall back to your default "
+            "role and capabilities."
+        )
+    return (
+        f"用户取消了{role_name}专家选择，立即停止使用之前该专家的角色、工作流和独有能力，"
+        "回退到你的默认角色和能力。"
+    )
+
+
 class DeepAgent(BaseAgent):
     """High-level agent that delegates to an internal ReActAgent."""
 
@@ -274,6 +305,7 @@ class DeepAgent(BaseAgent):
         self._auto_invoke_scheduled: bool = False
         self._bound_session_id: Optional[str] = None
         self._load_records: dict[str, LoadRecord] = {}
+        self._active_agent_template: tuple[str, str] | None = None
         self._session_toolkit: SessionToolkit | None = None
         self._pending_harness_configs: List[str] = []
         self.prompt_attachment_manager: PromptAttachmentManager = PromptAttachmentManager()
@@ -553,6 +585,18 @@ class DeepAgent(BaseAgent):
         self._sync_prompt_builder_references()
         logger.info("[DeepAgent] Model configuration hot reloaded")
 
+    def _extension_bound_tool_names(self) -> set[str]:
+        """Return tool names owned by successful Plugin / AgentTemplate loads."""
+        names: set[str] = set()
+        for record in self._load_records.values():
+            for ref in record.refs:
+                if ref.kind != ResourceKind.TOOL:
+                    continue
+                for name in ref.extra.get("ability_names") or ():
+                    if name:
+                        names.add(str(name))
+        return names
+
     def _hot_reload_tools(
         self,
         config: DeepAgentConfig,
@@ -573,11 +617,17 @@ class DeepAgent(BaseAgent):
         }
 
         # Only remove tools that were previously managed by config.tools.
-        # Rail-registered tools such as task_tool must survive hot reload.
+        # Rail-registered tools such as task_tool, and extension/plugin tools
+        # recorded in ``_load_records``, must survive hot reload.
         managed_tool_names = set(previous_by_name)
         if not managed_tool_names:
             managed_tool_names = set(new_by_name)
-        stale = [name for name in managed_tool_names if name not in new_by_name]
+        extension_tool_names = self._extension_bound_tool_names()
+        stale = [
+            name
+            for name in managed_tool_names
+            if name not in new_by_name and name not in extension_tool_names
+        ]
         if stale:
             for name in stale:
                 card = previous_by_name.get(name)
@@ -618,7 +668,6 @@ class DeepAgent(BaseAgent):
             ))
         else:
             prompt_builder.add_section(build_identity_section(language))
-        prompt = prompt_builder.build()
         new_react_config = self._react_agent.config.model_copy()
         new_react_config.prompt_template = [
             {"role": "system", "content": _render_identity_prompt(prompt_builder, language)}
@@ -1149,12 +1198,12 @@ class DeepAgent(BaseAgent):
             self.ability_manager.add(mcp_config)
 
     async def _resolve_read_image_multimodal(self) -> None:
-        """Resolve read_file image modality when it is set to auto.
+        """Warm the native-image capability decision when it is set to auto.
 
         A probe costs a full LLM round-trip, so it never blocks startup: a
-        cached verdict is applied straight away, otherwise the probe runs in the
-        background and this run stays metadata-only (``None`` is falsy at every
-        read site). Later agents on the same endpoint and model reuse the cache.
+        cached verdict is consumed dynamically by image-input call sites;
+        otherwise the probe runs in the background. The config remains ``None``
+        so auto mode follows later probe completion and main-model changes.
         """
         config = self._deep_config
         if config is None or config.enable_read_image_multimodal is not None:
@@ -1162,14 +1211,12 @@ class DeepAgent(BaseAgent):
 
         if config.model is None:
             logger.debug(
-                "[DeepAgent] no model configured; disabling read_file image multimodal",
+                "[DeepAgent] no model configured; native image input remains unavailable",
             )
-            config.enable_read_image_multimodal = False
             return
 
         cached = get_cached_image_support(config.model)
         if cached is not None:
-            config.enable_read_image_multimodal = cached
             logger.info(
                 "[DeepAgent] read_file image multimodal from probe cache: %s",
                 cached,
@@ -1178,7 +1225,7 @@ class DeepAgent(BaseAgent):
 
         logger.info(
             "[DeepAgent] read_file image multimodal not probed yet; "
-            "probing in background and degrading to metadata-only for this run",
+            "probing in background and using metadata-only until resolved",
         )
         schedule_image_support_probe(config.model)
 
@@ -1414,13 +1461,22 @@ class DeepAgent(BaseAgent):
                 language=self._deep_config.language
             )
 
+        subagent_rails = None
+        if spec.rails is not None:
+            subagent_rails = []
+            for rail in spec.rails:
+                fork_for_agent = getattr(rail, "fork_for_agent", None)
+                subagent_rails.append(
+                    fork_for_agent() if callable(fork_for_agent) else rail
+                )
+
         create_kwargs = {
             "model": spec.model or self._deep_config.model,
             "card": spec.agent_card,
             "system_prompt": spec.system_prompt,
             "tools": spec.tools,
             "mcps": spec.mcps,
-            "rails": spec.rails,
+            "rails": subagent_rails,
             "enable_task_loop": spec.enable_task_loop,
             "max_iterations": (
                 spec.max_iterations
@@ -1512,7 +1568,7 @@ class DeepAgent(BaseAgent):
                     )
                     factory_kwargs.setdefault(
                         "enable_read_image_multimodal",
-                        parent_image_support is True,
+                        parent_image_support,
                     )
                 if browser_capabilities is not None:
                     factory_kwargs["browser_capabilities"] = list(browser_capabilities)
@@ -1597,6 +1653,11 @@ class DeepAgent(BaseAgent):
             query = inputs.get("query", "")
             conversation_id = inputs.get("conversation_id")
             parent_session_id = inputs.get("parent_session_id")
+            invocation_id = inputs.get("invocation_id")
+            parent_invocation_id = inputs.get("parent_invocation_id")
+            delegation_id = inputs.get("delegation_id")
+            agent_path = inputs.get("agent_path")
+            depth = int(inputs.get("depth") or 0)
             run = inputs.get("run", {})
             run_kind = None
             run_context = None
@@ -1628,12 +1689,22 @@ class DeepAgent(BaseAgent):
             query = inputs
             conversation_id = None
             parent_session_id = None
+            invocation_id = None
+            parent_invocation_id = None
+            delegation_id = None
+            agent_path = None
+            depth = 0
             run_kind = None
             run_context = None
         elif isinstance(inputs, InteractiveInput):
             query = inputs
             conversation_id = None
             parent_session_id = None
+            invocation_id = None
+            parent_invocation_id = None
+            delegation_id = None
+            agent_path = None
+            depth = 0
             run_kind = None
             run_context = None
         else:
@@ -1648,6 +1719,11 @@ class DeepAgent(BaseAgent):
             run_kind=run_kind,
             run_context=run_context,
             parent_session_id=parent_session_id,
+            invocation_id=invocation_id,
+            parent_invocation_id=parent_invocation_id,
+            delegation_id=delegation_id,
+            agent_path=agent_path,
+            depth=depth,
         )
         return invoke_inputs
 
@@ -1695,6 +1771,16 @@ class DeepAgent(BaseAgent):
             effective_inputs["conversation_id"] = invoke_inputs.conversation_id
         if invoke_inputs.parent_session_id is not None:
             effective_inputs["parent_session_id"] = invoke_inputs.parent_session_id
+        if invoke_inputs.invocation_id is not None:
+            effective_inputs["invocation_id"] = invoke_inputs.invocation_id
+        if invoke_inputs.parent_invocation_id is not None:
+            effective_inputs["parent_invocation_id"] = invoke_inputs.parent_invocation_id
+        if invoke_inputs.delegation_id is not None:
+            effective_inputs["delegation_id"] = invoke_inputs.delegation_id
+        if invoke_inputs.agent_path is not None:
+            effective_inputs["agent_path"] = list(invoke_inputs.agent_path)
+        if invoke_inputs.depth:
+            effective_inputs["depth"] = invoke_inputs.depth
         if invoke_inputs.run_kind is not None:
             effective_inputs["run_kind"] = invoke_inputs.run_kind
         if invoke_inputs.run_context is not None:
@@ -1943,7 +2029,9 @@ class DeepAgent(BaseAgent):
             ctx.extras["source_root"] = str(manifest_path.parent)
             ctx.extras["_parent_model"] = self.deep_config.model
             parts = resolve_agent_template_parts(spec, ctx)
-            return await self._apply_extension_parts(parts, source_uri=str(manifest_path))
+            record = await self._apply_extension_parts(parts, source_uri=str(manifest_path))
+            self._active_agent_template = (record.load_id, spec.agent_card.name)
+            return record
         except Exception as exc:
             raise build_error(
                 StatusCode.DEEPAGENT_LOAD_AGENT_TEMPLATE_ERROR,
@@ -1968,7 +2056,9 @@ class DeepAgent(BaseAgent):
             ctx = self._new_extension_context(context)
             ctx.extras["_parent_model"] = self.deep_config.model
             parts = resolve_agent_template_parts(spec, ctx)
-            return await self._apply_extension_parts(parts, source_uri=None)
+            record = await self._apply_extension_parts(parts, source_uri=None)
+            self._active_agent_template = (record.load_id, spec.agent_card.name)
+            return record
         except Exception as exc:
             raise build_error(
                 StatusCode.DEEPAGENT_LOAD_AGENT_TEMPLATE_ERROR,
@@ -2021,6 +2111,11 @@ class DeepAgent(BaseAgent):
                 return []
             labels = await unapply_extension_hot(self, owned.refs)
             self._load_records.pop(record.load_id, None)
+            if (
+                self._active_agent_template is not None
+                and self._active_agent_template[0] == record.load_id
+            ):
+                self._active_agent_template = None
             return labels
         except Exception as exc:
             raise build_error(
@@ -2139,9 +2234,22 @@ class DeepAgent(BaseAgent):
         self._registered_rails.append(rail)
 
     async def _run_single_round_invoke(
-        self, ctx: AgentCallbackContext, session: Optional[Session]
+        self,
+        ctx: AgentCallbackContext,
+        session: Optional[Session],
+        *,
+        streaming: bool = False,
     ) -> Dict[str, Any]:
-        """Invoke inner ReActAgent exactly once."""
+        """Invoke inner ReActAgent exactly once.
+
+        Args:
+            ctx: Callback context carrying the normalized invocation inputs.
+            session: Session shared with the long-lived interaction.
+            streaming: Whether model chunks should be written to the session stream.
+
+        Returns:
+            The completed ReAct invocation result.
+        """
         modified = ctx.inputs
         if not isinstance(modified, InvokeInputs):
             raise build_error(
@@ -2155,10 +2263,14 @@ class DeepAgent(BaseAgent):
                 error_msg="DeepAgent not configured. Call configure() first.",
             )
 
-        return await self._react_agent.invoke(
-            self._to_effective_inputs(modified),
-            session,
-        )
+        effective_inputs = self._to_effective_inputs(modified)
+        if streaming:
+            return await self._react_agent.invoke(
+                effective_inputs,
+                session,
+                _streaming=True,
+            )
+        return await self._react_agent.invoke(effective_inputs, session)
 
     async def _setup_task_loop(
         self,
@@ -2762,6 +2874,63 @@ class DeepAgent(BaseAgent):
         ):
             yield chunk
 
+    async def _sync_expert_role_attachment(
+        self,
+        invoke_inputs: InvokeInputs,
+        session: Session | None,
+    ) -> None:
+        """Materialize the current AgentTemplate role onto this round's session.
+        """
+        try:
+            session_id = (
+                session.get_session_id()
+                if session is not None
+                else invoke_inputs.conversation_id
+            )
+            if not session_id:
+                return
+
+            manager = self.prompt_attachment_manager
+            language = resolve_language(
+                self._deep_config.language if self._deep_config is not None else None
+            )
+            if self._active_agent_template is not None:
+                role_name = self._active_agent_template[1]
+                await manager.add_section(
+                    session_id=session_id,
+                    section=_EXPERT_ROLE_SECTION,
+                    content=_expert_role_load_content(role_name, language),
+                    kind=PromptAttachmentKind.RUNTIME,
+                    source=_EXPERT_ROLE_SOURCE,
+                    metadata={"role_name": role_name},
+                )
+                return
+
+            attachments = await manager.collect_for_session(session_id)
+            current = next(
+                (item for item in attachments if item.section == _EXPERT_ROLE_SECTION),
+                None,
+            )
+            if current is None:
+                return
+            role_name = current.metadata.get("role_name")
+            if not role_name:
+                return
+            await manager.add_section(
+                session_id=session_id,
+                section=_EXPERT_ROLE_SECTION,
+                content=_expert_role_unload_content(role_name, language),
+                kind=PromptAttachmentKind.RUNTIME,
+                source=_EXPERT_ROLE_SOURCE,
+                metadata={"role_name": role_name},
+            )
+        except Exception as exc:  # noqa: BLE001 - role notices must not block the model
+            logger.warning(
+                "[DeepAgent] failed to sync expert_role attachment: %s",
+                exc,
+                exc_info=True,
+            )
+
     async def invoke(
         self,
         inputs: Any,
@@ -2786,6 +2955,7 @@ class DeepAgent(BaseAgent):
                 AgentCallbackEvent.BEFORE_INVOKE,
                 AgentCallbackEvent.AFTER_INVOKE,
             ):
+                await self._sync_expert_role_attachment(invoke_inputs, session)
                 if (
                     self._deep_config is not None
                     and self._deep_config.enable_task_loop
@@ -2830,6 +3000,7 @@ class DeepAgent(BaseAgent):
                 AgentCallbackEvent.BEFORE_INVOKE,
                 AgentCallbackEvent.AFTER_INVOKE,
             ):
+                await self._sync_expert_role_attachment(invoke_inputs, session)
                 if (
                     self._deep_config is not None
                     and self._deep_config.enable_task_loop
@@ -3090,8 +3261,13 @@ class DeepAgent(BaseAgent):
                 AgentCallbackEvent.BEFORE_INVOKE,
                 AgentCallbackEvent.AFTER_INVOKE,
             ):
+                await self._sync_expert_role_attachment(invoke_inputs, session)
                 if is_resume_input:
-                    result = await self._run_single_round_invoke(ctx, session)
+                    result = await self._run_single_round_invoke(
+                        ctx,
+                        session,
+                        streaming=True,
+                    )
                 else:
                     await controller.submit_round(
                         session,

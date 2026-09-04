@@ -120,6 +120,7 @@ class TeamBackend:
         on_before_team_cleaned: Callable[[], Awaitable[None]] | None = None,
         on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
         on_team_built: Callable[[], Awaitable[None]] | None = None,
+        on_member_started: Callable[[str], Awaitable[None]] | None = None,
         plan_storage_dir: str | None = None,
         plan_id: str | None = None,
         leader_member_name: str | None = None,
@@ -192,6 +193,12 @@ class TeamBackend:
                 is deleted, before best-effort cleanup and event publishing.
             on_team_built: Optional async callback fired exactly once after
                 ``build_team`` creates the team row and initial members.
+            on_member_started: Optional async callback that launches the agent
+                process for one member name. Supplied by the hosting
+                ``TeamAgent`` (leader side only) and consumed by
+                ``autostart_unstarted``; leaving it None turns every
+                auto-start into a no-op, which is what an external
+                (out-of-process) backend wants — it has no process to spawn.
             leader_prompt: The leader's private prompt (``LeaderSpec.prompt``
                 via ``ctx.prompt``). Persisted on the leader's DB row at
                 ``build_team`` so cold-recovery — which rebuilds the leader
@@ -267,6 +274,9 @@ class TeamBackend:
         self._on_before_team_cleaned = on_before_team_cleaned
         self._on_team_cleaned = on_team_cleaned
         self._on_team_built = on_team_built
+        # Spawns one member's agent process. The single injection point for
+        # every auto-start path that goes through ``autostart_unstarted``.
+        self._on_member_started = on_member_started
 
         self.task_manager = TeamTaskManager(
             self.team_name,
@@ -583,6 +593,7 @@ class TeamBackend:
         execution_status: ExecutionStatus = ExecutionStatus.IDLE,
         mode: MemberMode = MemberMode.BUILD_MODE,
         allocation: Optional["Allocation"] = None,
+        fallback_allocation: Optional["Allocation"] = None,
         role: TeamRole = TeamRole.TEAMMATE,
         isolation: Optional[str] = None,
         cli_agent: Optional[str] = None,
@@ -607,6 +618,8 @@ class TeamBackend:
                 can refresh in-place via the live session pool. ``None``
                 when the team is not configured with a pool, in which
                 case the member uses its per-agent default model.
+            fallback_allocation: Pool allocation reserved for an external CLI
+                member when its native authentication is unavailable.
             role: ``TeamRole`` enum value persisted on the member row.
                 Defaults to ``TEAMMATE`` for the ordinary teammate
                 spawn paths; ``spawn_human_agent`` overrides with
@@ -639,6 +652,7 @@ class TeamBackend:
 
         options = build_member_options(
             model_ref=allocation.to_db_ref() if allocation is not None else None,
+            fallback_model_ref=(fallback_allocation.to_db_ref() if fallback_allocation is not None else None),
             cli_agent=cli_agent,
             worktree_isolation=isolation,
             permissions_override=permissions_override,
@@ -758,6 +772,30 @@ class TeamBackend:
             await self.startup_member(member.member_name, on_created)
             started.append(member.member_name)
         return started
+
+    async def autostart_unstarted(self) -> list[str]:
+        """Start every UNSTARTED member using the injected spawn callback.
+
+        The shared entry point for the auto-start funnel: work that is about
+        to be handed to a member — a message, a freshly created task — must
+        not land on a member whose agent process was never launched. Callers
+        state the intent ("make sure the roster is up") without each carrying
+        its own spawn callback.
+
+        Leader-only and callback-gated, so a teammate backend or an external
+        out-of-process backend answers with an empty list instead of trying to
+        spawn something it cannot own. Concurrency is still settled one level
+        down by ``startup_member``'s UNSTARTED→STARTING CAS, which makes
+        repeated calls idempotent: whoever gets there second finds nothing in
+        UNSTARTED and does nothing.
+
+        Returns:
+            The member names started by this call; empty when there was
+            nothing to start or this backend does not own spawning.
+        """
+        if not self.is_leader or self._on_member_started is None:
+            return []
+        return await self.startup(on_created=self._on_member_started)
 
     async def startup_member(
         self,
@@ -1434,6 +1472,52 @@ class TeamBackend:
         )
         return max(db_ts, md_max)
 
+    async def get_team_updated_at_state(self) -> tuple[int, bool]:
+        """Probe the team_card ``updated_at`` plus its presence flag.
+
+        Counterpart of :meth:`get_team_updated_at` narrowed to the team_card
+        md file (the only team B-class file whose body enters the team-info
+        block; ``team_prompt`` is a write-only placeholder whose body never
+        renders). Also surfaces whether the frontmatter carried an explicit
+        ``updated_at`` integer so the team-info re-announce path can treat
+        ``present=False`` (a blank field — the evolution party edited the
+        ``team_card.md`` body without stamping it) as an explicit "must
+        update" signal, symmetric with :meth:`get_member_updated_at_state`.
+
+        When the cache is absent (evolution off / single-agent) the md probe
+        has nothing to read, so the DB column is probed instead and surfaced
+        with ``present=True``: the team-info re-announce path then compares
+        the DB timestamp wall-clock (a ``build_team`` / team mutation moves
+        it and re-delivers), preserving the pre-evolution behaviour. Evolution
+        on stays md-only (the DB column is shadowed by ``get_team_info``'s md
+        overlay, so a DB-only change shows nothing new to announce).
+
+        Returns:
+            ``(updated_at_ms, present)`` — ``(db_ts, True)`` when the cache is
+            absent (evolution off; DB column drives the probe), the md pair
+            otherwise.
+        """
+        cache = self.workspace_cache
+        if cache is None:
+            db_ts = await self.db.team.get_team_updated_at(self.team_name)
+            return (db_ts, True)
+        return cache.get_team_updated_at_state("desc")
+
+    async def stamp_team_card_updated_at(self, ts: int) -> None:
+        """Stamp ``ts`` into ``team_card.md``'s ``updated_at`` (meta only).
+
+        Thin forward to the workspace cache, which owns all md-file IO. Called
+        by the team-info re-announce path right after a "must update" decision
+        so the comparison baseline and the file's ``updated_at`` share one
+        timestamp (next probe is stable, no re-fire). No-op when the cache is
+        absent (evolution off / single-agent). Symmetric with
+        :meth:`stamp_member_prompt_updated_at`.
+        """
+        cache = self.workspace_cache
+        if cache is None:
+            return
+        cache.stamp_team_updated_at("desc", ts)
+
     async def get_member_updated_at(self, member_name: str, field: str) -> int:
         """Probe one member's md ``updated_at`` for change detection.
 
@@ -2109,10 +2193,10 @@ class TeamBackend:
         confused about whether its team exists, which the refusal corrects.
 
         Both conditions are required. ``_history_restored`` alone is not
-        enough: a recovered leader whose team was disbanded mid-run (the
-        all-teammates-SHUTDOWN path in ``CoordinationKernel.start`` calls
-        ``clean_team``) has no team row left and genuinely does need to build
-        one. The team row is what says a team is there to be rejoined.
+        enough: a recovered leader whose team was disbanded (its own
+        ``clean_team``, or the operator's ``delete_agent_team``) has no team
+        row left and genuinely does need to build one. The team row is what
+        says a team is there to be rejoined.
 
         Returns:
             True when the leader is already attached, with history, to a team
@@ -2362,6 +2446,8 @@ class TeamBackend:
         desc: str = "",
         prompt: str,
         model_name: Optional[str] = None,
+        allocation: Optional["Allocation"] = None,
+        fallback_allocation: Optional["Allocation"] = None,
     ) -> MemberOpResult:
         """Register an external-CLI teammate dynamically.
 
@@ -2381,8 +2467,13 @@ class TeamBackend:
                 Optional; defaults to empty.
             prompt: Private system prompt the CLI adopts to act as this
                 member. Required.
-            model_name: Ignored for external-CLI members (the model lives in
-                the external CLI); accepted for signature symmetry.
+            model_name: Optional model-name hint; passed to the pool allocator
+                to select a matching model endpoint.
+            allocation: Optional pool allocation for this member; persisted as a
+                ``{model_name, model_index}`` reference so credentials
+                refreshes propagate without re-spawning.
+            fallback_allocation: Required fallback allocation used only when
+                the native CLI reports an authentication failure.
 
         Returns:
             ``MemberOpResult`` — failure if the backend name is unknown or the
@@ -2423,6 +2514,8 @@ class TeamBackend:
             mode=self.teammate_mode,
             role=TeamRole.EXTERNAL_CLI,
             cli_agent=cli_agent,
+            allocation=allocation,
+            fallback_allocation=fallback_allocation,
         )
         if not result.ok:
             self._external_cli_specs.pop(member_name, None)

@@ -18,7 +18,6 @@ from openjiuwen.agent_teams.agent.infra import TeamInfra
 from openjiuwen.agent_teams.agent.payload import SpawnPayloadBuilder
 from openjiuwen.agent_teams.agent.resources import PrivateAgentResources
 from openjiuwen.agent_teams.harness import TeamHarness
-from openjiuwen.agent_teams.kv_cache import kv_cache_hooks
 from openjiuwen.agent_teams.messager import (
     Messager,
     create_messager,
@@ -291,9 +290,6 @@ class AgentConfigurator:
 
             self.model_allocator = build_model_allocator(spec, ctx.team_spec)
 
-        if ctx.role == TeamRole.LEADER:
-            kv_cache_hooks.ensure_leader_registry(self)
-
         self.setup_team_backend(
             spec,
             ctx,
@@ -483,12 +479,29 @@ class AgentConfigurator:
 
         # cwd is a separate layer from the workspace. The workspace stays the
         # member's private artifact directory (memory, Skill visibility
-        # declaration, .team mount); cwd is where shell runs and relative paths
-        # resolve. Team isolation moves cwd into the worktree without dragging
-        # the workspace along -- otherwise the member's artifacts and its Skill
-        # grants would live inside an ephemeral checkout and vanish with it.
-        member_cwd = ctx.worktree_path or agent_spec.cwd or None
-        member_project_root = agent_spec.project_root or agent_spec.cwd or None
+        # declaration); cwd is where shell runs and relative paths resolve. Team
+        # isolation moves cwd into the worktree without dragging the workspace
+        # along -- otherwise the member's artifacts and its Skill grants would
+        # live inside an ephemeral checkout and vanish with it. A projectless
+        # team member (no project, no worktree) instead runs in its own
+        # isolated ``work/<member>/`` under the shared artifact root, so its
+        # intermediate files stay per-member instead of piling up together.
+        worktree_path = ctx.worktree_path
+        project_root_or_cwd = agent_spec.project_root or agent_spec.cwd or None
+        if worktree_path:
+            member_cwd = worktree_path
+        elif project_root_or_cwd:
+            member_cwd = project_root_or_cwd
+        elif spec.build_context is not None:
+            # No project and no worktree: the platform may allocate a per-member
+            # work directory. Derive a member view (so the per-team root and the
+            # member name combine) and ask the platform for the work dir.
+            member_cwd = spec.build_context.derive(
+                member_name=ctx.member_name,
+            ).resolve_member_work_dir()
+        else:
+            member_cwd = None
+        member_project_root = project_root_or_cwd
 
         workspace_root_path = ws_spec.root_path if ws_spec is not None else None
         # The workspace is now always the member's own directory (never the
@@ -497,9 +510,6 @@ class AgentConfigurator:
         if workspace_root_path and self.team_backend is not None:
             self.team_backend.register_cleanup_path(workspace_root_path)
 
-        if self.workspace_manager and ws_spec and ws_spec.root_path:
-            self.workspace_manager.mount_into_workspace(ws_spec.root_path)
-
         model_config = ctx.member_model or agent_spec.model
 
         sys_operation_spec = agent_spec.sys_operation or SysOperationSpec(
@@ -507,12 +517,10 @@ class AgentConfigurator:
             mode=OperationMode.LOCAL,
             work_config=LocalWorkConfig(shell_allowlist=None),
         )
-        # Members default to metadata-only read_file images: the modality probe
-        # costs a full LLM round-trip per member on every team start. A blueprint
-        # that wants native image input says so explicitly on the agent spec.
+        # Keep ``None`` as auto mode. Image support is cached process-wide by
+        # endpoint and model, so team members reuse the main warm-up verdict
+        # instead of paying for one probe per member.
         enable_read_image_multimodal = agent_spec.enable_read_image_multimodal
-        if enable_read_image_multimodal is None:
-            enable_read_image_multimodal = False
         # Skills are cleared and discovery is switched off on purpose: the
         # DeepAgent factory auto-adds the generic SkillUseRail when either is
         # truthy, and that rail scans the member workspace's own ``skills/``
@@ -540,11 +548,18 @@ class AgentConfigurator:
         resolved_team_name = (ctx.team_spec.team_name if ctx.team_spec else None) or spec.team_name
         teammate_mode = str(spec.teammate_mode)
 
-        team_workspace_mount: str | None = None
         team_workspace_path: str | None = None
         if self.workspace_manager:
-            team_workspace_mount = f".team/{resolved_team_name}/"
             team_workspace_path = self.workspace_manager.workspace_path
+        # The team's shared final-deliverables directory travels on the build
+        # context (platform-filled for projectless members, None for members
+        # bound to a project). Surfaced to the team info body by the policy
+        # rail only when set, so members with a project keep the bullet off.
+        team_outputs_dir: str | None = (
+            spec.build_context.team_outputs_dir
+            if spec.build_context is not None
+            else None
+        )
 
         # Decide which team rails this member gets, as declarative RailSpecs.
         # Live handles ride on the build context's extras (injected below); only
@@ -552,6 +567,8 @@ class AgentConfigurator:
         # team config (predefined roster, plan-mode, reliability gating) stay
         # here; "can it build" gates (a missing handle) live in the factories.
         from openjiuwen.agent_teams.rails.elements import (
+            OBSERVABILITY,
+            TEAM_OBSERVABILITY,
             TEAM_PLAN_MODE,
             TEAM_POLICY,
             TEAM_RELIABILITY,
@@ -567,9 +584,15 @@ class AgentConfigurator:
 
         ensure_harness_elements_registered()
 
-        # Observability rail spec — shared by all agents (members + swarmflow workers).
-        # The provider checks is_initialized() — no-op when disabled.
-        observability_rail_spec = RailSpec(type="core.observability")
+        # Observability rail specs — shared by all agents (members + swarmflow
+        # workers). Two rails, always mounted as a pair: ``core.observability``
+        # owns the agent span itself (harness-level, team-agnostic) and
+        # ``core.team.observability`` layers the team identity onto it. Each
+        # provider checks is_initialized() — no-op when disabled.
+        observability_rail_specs = [
+            RailSpec(type=TEAM_OBSERVABILITY),
+            RailSpec(type=OBSERVABILITY),
+        ]
 
         # Predefined teams pin their roster — strip every dynamic spawn tool
         # (one per role_type) from the leader's tool set.
@@ -604,8 +627,8 @@ class AgentConfigurator:
                     "team_mode": _resolve_team_mode(spec),
                     "dispatch_mode": spec.dispatch_mode,
                     "base_prompt": agent_spec.system_prompt,
-                    "team_workspace_mount": team_workspace_mount,
                     "team_workspace_path": team_workspace_path,
+                    "team_outputs_dir": team_outputs_dir,
                     "expose_human_agents_to_teammates": spec.expose_human_agents_to_teammates,
                     "steer_batch_size": spec.steer_batch_size,
                     "fork_source": ctx.fork_source or "",
@@ -744,7 +767,7 @@ class AgentConfigurator:
             if swarmflow_worker_base_spec is not None:
                 swarmflow_worker_base_spec = swarmflow_worker_base_spec.model_copy(
                     update={
-                        "rails": list(swarmflow_worker_base_spec.rails or []) + [observability_rail_spec],
+                        "rails": list(swarmflow_worker_base_spec.rails or []) + observability_rail_specs,
                     },
                 )
 
@@ -772,7 +795,6 @@ class AgentConfigurator:
             workspace_manager=self.workspace_manager,
             model_allocator=self.model_allocator,
             messager=self.messager,
-            on_teammate_created=self._on_teammate_created,
             swarmflow_model_resolver=swarmflow_model_resolver,
             swarmflow_worker_base_spec=swarmflow_worker_base_spec,
             swarmflow_human_base_spec=swarmflow_human_base_spec,
@@ -785,7 +807,7 @@ class AgentConfigurator:
 
         # Fold the team rails into the spec rails (after the user rails, to keep
         # the init order consistent with the legacy mount order).
-        team_rail_specs.append(observability_rail_spec)
+        team_rail_specs.extend(observability_rail_specs)
         base_rails = _apply_team_worktree_shell_guard(
             list(build_spec.rails or []),
             enabled=ctx.role in {TeamRole.LEADER, TeamRole.TEAMMATE, TeamRole.EXTERNAL_CLI},
@@ -841,6 +863,17 @@ class AgentConfigurator:
             initial_plan_mode=is_team_plan_leader,
             build_context=member_build_context,
         )
+
+        # Leader's own model calls (decision / tool use / script generation) bill
+        # the session budget — NOT the per-run budget. Only when swarmflow is
+        # enabled (swarmflow_budget is a real ledger) does the leader carry this
+        # rail; the per-run ledger is passed as None so the rail only adds to the
+        # session pool. TinyAgent intent classify gets the same treatment in
+        # avatar_session_backend.
+        if swarmflow_budget is not None and ctx.role == TeamRole.LEADER:
+            from openjiuwen.agent_teams.workflow.backends.budget_rail import SwarmflowBudgetRail
+
+            self.harness.add_rail(SwarmflowBudgetRail(swarmflow_budget, workflow_budget=None))
 
         # Team memory manager (only when explicitly enabled in the spec).
         self.memory_manager = self._build_memory_manager(spec, ctx, agent_spec, resolved_language, member_name)
@@ -973,6 +1006,7 @@ class AgentConfigurator:
             on_before_team_cleaned=on_before_team_cleaned,
             on_team_cleaned=on_team_cleaned,
             on_team_built=on_team_built,
+            on_member_started=self._on_teammate_created,
             leader_member_name=ctx.team_spec.leader_member_name if ctx.team_spec else None,
         )
 

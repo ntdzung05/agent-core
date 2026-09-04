@@ -42,7 +42,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Sequence, TypeVar, overload
 
-from .errors import BudgetExhausted, WorkflowAborted, WorkflowError
+from .errors import BudgetExhausted, EngineError, WorkflowAborted
 from .journal import call_signature, key_str
 from .progress import ProgressKind, WorkflowProgressEvent
 from .schema import coerce, resolve_schema
@@ -190,25 +190,48 @@ def _outcome_from_result(raw_text: str | None, result: Any) -> str | None:
 
 
 def _check_abort(rt) -> None:
-    """Raise ``WorkflowAborted`` when an external pause signal is set.
+    """Raise ``WorkflowAborted`` when an external pause/stop signal is set.
 
     Called twice per ``agent()`` / session ``send()``: an entry gate (before the
     concurrency permit / backend) stops a queued call; a pre-journal guard (after
     the backend succeeds, before ``journal.use``) ensures a call that finished
     inside the pause window does NOT persist to the WAL — so a resume reruns it.
-    A ``None`` event disables both checks (the back-compat default).
+    The raised ``WorkflowAborted`` carries the signal's ``reason`` (``"pause"``
+    vs ``"stop"``) so the caller can tell a resumable pause from a terminal stop.
+    A ``None`` signal disables both checks (the back-compat default).
     """
     ev = rt.abort_event
     if ev is not None and ev.is_set():
-        raise WorkflowAborted()
+        raise WorkflowAborted(reason=ev.reason)
+
+
+def _top_phases(rt) -> list[tuple[str, int]] | None:
+    """Top-3 author phases by per-phase token consumption, or ``None`` when empty.
+
+    Reads the per-run ledger's ``phase_tokens`` tally (accumulated by the emit
+    hooks below), so an exhausted run can tell the leader which phases burned
+    the most tokens — the data the leader needs to redesign a workflow that
+    keeps hitting its ceiling.
+    """
+    acc = rt.workflow_budget.phase_tokens
+    if not acc:
+        return None
+    return sorted(acc.items(), key=lambda kv: kv[1], reverse=True)[:3]
 
 
 def _check_budget(rt) -> None:
-    """Raise ``BudgetExhausted`` when the run has burned its token ceiling.
+    """Raise ``BudgetExhausted`` when either ledger has hit its ceiling.
 
-    The run's hard ceiling, checked once per ``agent()`` / session ``send()``,
-    at the entry gate only: a call already paid for must reach its journal
-    record, or a resume would rerun (and re-pay for) it.
+    Two ceilings, checked once per ``agent()`` / session ``send()``, at the
+    entry gate only: a call already paid for must reach its journal record, or
+    a resume would rerun (and re-pay for) it.
+
+    Order-sensitive — **session first**: when both ledgers are dry, the
+    terminal (not retryable) session reason wins. Relaunching after a session
+    exhaustion hits the same gate immediately, so reporting ``"workflow"``
+    would mislead the leader into "redesign the workflow" when raising the
+    ceiling is the only way forward. A session still holding headroom never
+    masks a per-run (workflow) exhaustion — that check still runs right after.
 
     This gate alone cannot hold the line — one agent's own loop can burn the
     whole budget long before it returns here. It is the backend's rails that
@@ -216,7 +239,17 @@ def _check_budget(rt) -> None:
     """
     if rt.budget.exhausted:
         raise BudgetExhausted(
-            f"token budget exhausted: {rt.budget.spent}/{rt.budget.total}"
+            f"session token budget exhausted: {rt.budget.spent}/{rt.budget.total}",
+            scope="session", spent=rt.budget.spent, total=rt.budget.total,
+            workflow_spent=rt.workflow_budget.spent, workflow_total=rt.workflow_budget.total,
+            top_phases=_top_phases(rt),
+        )
+    if rt.workflow_budget.exhausted:
+        raise BudgetExhausted(
+            f"workflow token budget exhausted: {rt.workflow_budget.spent}/{rt.workflow_budget.total}",
+            scope="workflow", spent=rt.workflow_budget.spent, total=rt.workflow_budget.total,
+            workflow_spent=rt.workflow_budget.spent, workflow_total=rt.workflow_budget.total,
+            top_phases=_top_phases(rt),
         )
 
 
@@ -254,15 +287,37 @@ def _deepest_branch_i(path: tuple) -> int | None:
     return i
 
 
-def _budget_snapshot(ledger) -> dict:
-    """Freeze a ``BudgetLedger`` into the wire shape ``{total, spent, remaining, scope, exhausted}``."""
+def _budget_snapshot(ledger, scope: str = "session") -> dict:
+    """Freeze a ``BudgetLedger`` into the wire shape ``{total, spent, remaining, scope, exhausted}``.
+
+    ``scope`` is ``"session"`` for the team-wide ledger (``rt.budget``) or
+    ``"workflow"`` for the per-run ledger (``rt.workflow_budget``). Kept as a
+    parameter so emit sites can tag which ledger a snapshot came from; the
+    snapshot is a point-in-time observation under concurrency, not a strong
+    consistency guarantee.
+    """
     return {
         "total": ledger.total,
         "spent": ledger.spent,
         "remaining": ledger.remaining(),
-        "scope": "leader",
+        "scope": scope,
         "exhausted": ledger.exhausted,
     }
+
+
+def _wf_budget_snapshot(rt) -> dict | None:
+    """Snapshot the per-run ledger, always — even when it has no ceiling set.
+
+    A script that does not declare ``workflow_token_limit`` gets an unbounded
+    per-run ledger (``total=None``); its snapshot still reports ``spent`` so a
+    frontend can render an "unbounded" run-budget badge with live consumption
+    (the TUI's own formatter ignores snapshots without a numeric ``total``,
+    so this changes nothing for it).
+    """
+    wb = rt.workflow_budget
+    if wb is None:
+        return None
+    return _budget_snapshot(wb, scope="workflow")
 
 
 def _resolved_nested_phase(explicit: str | None = None) -> str | None:
@@ -292,6 +347,11 @@ def _emit_agent_started(
     correlation_id: str | None = None,
     nested_phase: str | None = None,
 ) -> None:
+    rt.current_agent = {
+        "agent_id": agent_id,
+        "label": opts.get("label"),
+        "started_spent": rt.workflow_budget.spent,
+    }
     rt.progress_sink(
         WorkflowProgressEvent(
             kind=ProgressKind.AGENT_STARTED,
@@ -319,6 +379,8 @@ def _emit_agent_completed(
     ``budget_snapshot``: frozen ``_budget_snapshot(rt.budget)`` at emit time.
     ``nested_phase``: defaults to ``_wf_display_name`` when inside a sub-workflow.
     """
+    rt.workflow_budget.add_phase(opts.get("phase") or _current_phase.get() or "?", tokens)
+    rt.current_agent = None
     rt.progress_sink(
         WorkflowProgressEvent(
             kind=ProgressKind.AGENT_COMPLETED,
@@ -328,6 +390,7 @@ def _emit_agent_completed(
             agent_id=agent_id,
             tokens=tokens,
             budget=budget_snapshot,
+            workflow_budget=_wf_budget_snapshot(rt),
             nested_phase=_resolved_nested_phase(nested_phase),
         )
     )
@@ -338,6 +401,8 @@ def _emit_agent_failed(
     tokens: int | None = None, budget_snapshot: dict | None = None,
     nested_phase: str | None = None,
 ) -> None:
+    rt.workflow_budget.add_phase(opts.get("phase") or _current_phase.get() or "?", tokens)
+    rt.current_agent = None
     rt.progress_sink(
         WorkflowProgressEvent(
             kind=ProgressKind.AGENT_FAILED,
@@ -347,6 +412,7 @@ def _emit_agent_failed(
             agent_id=agent_id,
             tokens=tokens,
             budget=budget_snapshot,
+            workflow_budget=_wf_budget_snapshot(rt),
             nested_phase=_resolved_nested_phase(nested_phase),
         )
     )
@@ -378,7 +444,7 @@ def _build_opts(rt, explicit: dict, options: dict | None = None) -> dict:
         The merged, validated, ``None``-stripped options dict.
 
     Raises:
-        WorkflowError: If any key is outside the allowed set.
+        EngineError: If any key is outside the allowed set.
     """
     merged: dict = {}
     for key, value in (options or {}).items():
@@ -390,7 +456,7 @@ def _build_opts(rt, explicit: dict, options: dict | None = None) -> dict:
     allowed = _ENGINE_OPTIONS | getattr(rt.backend, "KNOWN_OPTIONS", frozenset())
     unknown = sorted(k for k in merged if k not in allowed)
     if unknown:
-        raise WorkflowError(
+        raise EngineError(
             f"unknown option(s) {unknown}; allowed: {sorted(allowed)}"
         )
     return merged
@@ -455,7 +521,7 @@ async def agent(
     # whitelists every key against ``_ENGINE_OPTIONS | backend.KNOWN_OPTIONS``.
     opts = _build_opts(rt, {"label": label, "phase": phase, "schema": schema}, options)
     if opts.get("isolation") not in (None, "worktree"):
-        raise WorkflowError("agent(options={'isolation': ...}) only supports 'worktree'")
+        raise EngineError("agent(options={'isolation': ...}) only supports 'worktree'")
     json_schema, model_cls = resolve_schema(opts.get("schema"))
 
     ks = key_str(_path.get() + (("call", _next_ordinal()),))
@@ -463,19 +529,28 @@ async def agent(
 
     _emit_agent_started(rt, opts, prompt, node_type="agent", agent_id=ks)
 
-    cached = rt.journal.get_cached(ks, sig)
+    cached = rt.journal.get_cached(ks, sig, rt.run_id)
     if cached is not None:  # resume hit — no semaphore, no backend
+        rt.log_sink(f"[wf] agent {opts.get('label') or 'agent'!r} key={ks} CACHE_HIT sig={sig[:12]}")
         await rt.journal.use(ks, cached)
         result = _rehydrate(cached, model_cls)
         # Prefer stored raw_text; if absent (old journal), fall back to
         # preamble + structured data via _preview()
         outcome_text = _outcome_from_result(cached.get("raw_text"), result)
+        # Re-bill the per-run ledger from the record's stored tokens so a
+        # resume rebuilds spent by replaying cache hits — the run's tally is
+        # recomputed agent-by-agent, not restored from a stale snapshot.
+        cached_tokens = cached.get("tokens")
+        if isinstance(cached_tokens, int) and cached_tokens > 0:
+            rt.workflow_budget.add(cached_tokens)
         _emit_agent_completed(
             rt, opts, outcome_text, agent_id=ks,
-            tokens=None, budget_snapshot=_budget_snapshot(rt.budget),
+            tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+            budget_snapshot=_budget_snapshot(rt.budget),
         )
         return result
 
+    rt.log_sink(f"[wf] agent {opts.get('label') or 'agent'!r} key={ks} CACHE_MISS sig={sig[:12]} (live run)")
     _check_abort(rt)  # entry gate: a paused run starts no new agent()
     _check_budget(rt)  # entry gate: a run out of tokens starts no new agent()
 
@@ -519,6 +594,8 @@ async def agent(
                 result=call_result.result,
                 model=model_cls,
                 raw_text=call_result.raw_text,
+                run_id=rt.run_id,
+                tokens=call_result.tokens,
             )
         ),
     )
@@ -626,6 +703,8 @@ class _JournalRecordInput:
     result: Any
     model: Any
     raw_text: str | None = None
+    run_id: str | None = None
+    tokens: int | None = None
 
 
 def _make_record(spec: _JournalRecordInput) -> dict:
@@ -640,6 +719,8 @@ def _make_record(spec: _JournalRecordInput) -> dict:
     return {
         "key": spec.key,
         "sig": spec.sig,
+        "run_id": spec.run_id,
+        "tokens": spec.tokens,
         "label": spec.opts.get("label"),
         "phase": spec.opts.get("phase"),
         "kind": kind,
@@ -781,12 +862,12 @@ async def verify(
         aggregated review feedback.
 
     Raises:
-        WorkflowError: If ``reviewers`` is empty.
+        EngineError: If ``reviewers`` is empty.
     """
     rt = _rt.get()
     reviewers = list(reviewers)
     if not reviewers:
-        raise WorkflowError("verify() requires at least one reviewer")
+        raise EngineError("verify() requires at least one reviewer")
     base = label or "verify"
 
     _emit_log(rt, f"verify: dispatching {len(reviewers)} reviewer(s)")
@@ -918,7 +999,7 @@ class AgentSession:
         """
         rt = _rt.get()
         if notify and schema is not None:
-            raise WorkflowError("send(notify=True) is text-only; don't also pass a schema")
+            raise EngineError("send(notify=True) is text-only; don't also pass a schema")
         # Per-task current phase; fall back to the session's own default.
         phase_val = _current_phase.get() if _current_phase.get() is not None else self._phase
         opts = _build_opts(
@@ -951,18 +1032,27 @@ class AgentSession:
             if self._member_name is None and not self._human:
                 await self._ensure_member_name(rt, opts)
 
-            cached = rt.journal.get_cached(ks, sig)
+            cached = rt.journal.get_cached(ks, sig, rt.run_id)
             if cached is not None:  # resume hit — no backend, no harness, no person
+                rt.log_sink(f"[wf] session {opts.get('label') or 'session'!r} key={ks} CACHE_HIT sig={sig[:12]}")
                 await rt.journal.use(ks, cached)
                 result = _rehydrate(cached, model_cls)
                 self._append_history(prompt, result, model_cls)
                 outcome_text = _outcome_from_result(cached.get("raw_text"), result)
+                cached_tokens = cached.get("tokens")
+                if isinstance(cached_tokens, int) and cached_tokens > 0:
+                    rt.workflow_budget.add(cached_tokens)
                 _emit_agent_completed(
                     rt, opts, outcome_text, agent_id=ks,
-                    tokens=None, budget_snapshot=_budget_snapshot(rt.budget),
+                    tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+                    budget_snapshot=_budget_snapshot(rt.budget),
                 )
                 return None if notify else result
 
+            rt.log_sink(
+                f"[wf] session {opts.get('label') or 'session'!r} key={ks} CACHE_MISS "
+                f"sig={sig[:12]} (live run, history_len={len(self._history)})"
+            )
             _check_abort(rt)  # entry gate: a paused run starts no new turn
             _check_budget(rt)  # entry gate: a run out of tokens starts no new turn
 
@@ -999,6 +1089,8 @@ class AgentSession:
                         result=result,
                         model=model_cls,
                         raw_text=call_result.raw_text,
+                        run_id=rt.run_id,
+                        tokens=call_result.tokens,
                     )
                 ),
             )
@@ -1053,9 +1145,9 @@ class AgentSession:
         inherit).
         """
         if self._human:
-            raise WorkflowError("fork() is only supported on agent_session")
+            raise EngineError("fork() is only supported on agent_session")
         if fork_mode != "full" and keep_rounds is None:
-            raise WorkflowError(
+            raise EngineError(
                 "fork() requires keep_rounds unless fork_mode='full'"
                 f" (fork_mode={fork_mode!r} has no split point without it)"
             )
@@ -1151,6 +1243,7 @@ class AgentSession:
         # miss) so we never re-mint a name and drift the counter across a resume.
         if not self._human:
             await self._ensure_member_name(rt, opts)
+        rt.log_sink(f"[wf] session {opts.get('label') or 'session'!r} opening backend session (avatar (re)created)")
         self._sid = await rt.backend.open_session(
             kind="human" if self._human else "agent",
             instructions=self._instructions,
@@ -1257,7 +1350,7 @@ async def parallel(thunks: Sequence[Callable[[], Awaitable]]) -> list:
     base = _path.get()
     thunks = list(thunks)
     if len(thunks) > _MAX_FANOUT:
-        raise WorkflowError(
+        raise EngineError(
             f"parallel() got {len(thunks)} thunks; the per-call limit is "
             f"{_MAX_FANOUT}. Split into batches instead of one giant fan-out."
         )
@@ -1283,7 +1376,7 @@ async def pipeline(items: Sequence, *stages: Callable) -> list:
     base = _path.get()
     items = list(items)
     if len(items) > _MAX_FANOUT:
-        raise WorkflowError(
+        raise EngineError(
             f"pipeline() got {len(items)} items; the per-call limit is "
             f"{_MAX_FANOUT}. Split into batches instead of one giant fan-out."
         )
@@ -1348,7 +1441,13 @@ def log(message: Any) -> None:
 
 
 class _Budget:
-    """Reads the active run's ledger via the contextvar — importable & run-agnostic.
+    """Reads the active run's **workflow-level** ledger via the contextvar.
+
+    Importable & run-agnostic: the public ``budget`` name in scripts now reports
+    the per-run budget (``rt.workflow_budget``, sourced from
+    ``META.workflow_token_limit``) — not the session-wide ledger — so a script
+    polling ``budget.remaining()`` sees exactly what "this run" has left before
+    its own ceiling, which is the ceiling the engine enforces for the run.
 
     Live rather than end-of-call: the ledger is written by the backend as each
     model call returns, so a script polling ``remaining()`` sees the burn of
@@ -1357,15 +1456,15 @@ class _Budget:
 
     @property
     def total(self) -> int | None:
-        return _rt.get().budget.total
+        return _rt.get().workflow_budget.total
 
     @staticmethod
     def spent() -> int:
-        return _rt.get().budget.spent
+        return _rt.get().workflow_budget.spent
 
     @staticmethod
     def remaining() -> int | None:
-        return _rt.get().budget.remaining()
+        return _rt.get().workflow_budget.remaining()
 
 
 #: Importable singleton: `from swarmflow import budget` then `budget.spent()`.
@@ -1456,5 +1555,5 @@ async def _invoke_loaded(loaded, args: Any) -> Any:
     """
     run_fn = getattr(loaded.module, "run", None)
     if not inspect.iscoroutinefunction(run_fn):
-        raise WorkflowError(f"{loaded.path}: must define `async def run(args)`")
+        raise EngineError(f"{loaded.path}: must define `async def run(args)`")
     return await (run_fn(args) if _arity(run_fn) >= 1 else run_fn())

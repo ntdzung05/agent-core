@@ -20,7 +20,6 @@ from typing import Any
 
 _TRACER_NAME = "openjiuwen.agent_teams.observability.codex"
 _NATIVE_EXPORT_QUIET_S = 0.15
-_MAX_INDEXED_MESSAGES = 48
 _ROLLOUT_TOOL_OVERLAP_TOLERANCE_NS = 250_000_000
 _EXEC_TOOL_PATTERN = re.compile(r"\btools\.([A-Za-z0-9_]+)\s*\(")
 _EXEC_TOOL_LITERAL_PATTERN = re.compile(
@@ -619,22 +618,21 @@ class CodexSpanBridge:
             AT_MEMBER_NAME,
             AT_SESSION_ID,
             AT_TEAM_NAME,
-            GEN_AI_COMPLETION,
+            GEN_AI_INPUT_MESSAGES,
             GEN_AI_OPERATION_NAME,
-            GEN_AI_PROMPT,
+            GEN_AI_OUTPUT_MESSAGES,
             GEN_AI_PROVIDER_NAME,
             GEN_AI_REQUEST_MESSAGE_COUNT,
             GEN_AI_REQUEST_MODEL,
             GEN_AI_RESPONSE_MODEL,
             GEN_AI_SYSTEM,
+            GEN_AI_SYSTEM_INSTRUCTIONS,
             GEN_AI_TOOL_CALLS,
             GEN_AI_USAGE_CACHE_TOKENS,
             GEN_AI_USAGE_COMPLETION_TOKENS,
             GEN_AI_USAGE_PROMPT_TOKENS,
             GEN_AI_USAGE_REASONING_TOKENS,
             GEN_AI_USAGE_TOTAL_TOKENS,
-            LANGFUSE_GEN_AI_COMPLETION,
-            LANGFUSE_GEN_AI_PROMPT,
             LANGFUSE_OBSERVATION_INPUT,
             LANGFUSE_OBSERVATION_OUTPUT,
             LANGFUSE_OBSERVATION_TYPE,
@@ -689,22 +687,25 @@ class CodexSpanBridge:
             span.set_attribute(AT_SESSION_ID, self._session_id)
             span.set_attribute(LANGFUSE_SESSION_ID, self._session_id)
 
-        emit_standard = config.backend != "langfuse"
-        attributes_per_message = 4 if emit_standard else 2
-        writable_messages = max(
-            (config.max_attributes - 40) // attributes_per_message,
-            0,
-        )
-        indexed_message_count = min(_MAX_INDEXED_MESSAGES, writable_messages)
-        indexed_messages = messages[-indexed_message_count:] if indexed_message_count else []
-        for index, message in enumerate(indexed_messages):
+        # One structured value per attribute: a per-message expansion here
+        # would grow with the conversation and evict this span's own identity
+        # attributes. Langfuse's indexed view is derived at export instead.
+        system_parts: list[dict[str, Any]] = []
+        input_messages: list[dict[str, Any]] = []
+        for message in messages:
             role = str(message.get("role") or "")
             content = redact_prompt(_content_text(message.get("content")), config)
-            if emit_standard:
-                span.set_attribute(f"{GEN_AI_PROMPT}.{index}.role", role)
-                span.set_attribute(f"{GEN_AI_PROMPT}.{index}.content", content)
-            span.set_attribute(f"{LANGFUSE_GEN_AI_PROMPT}.{index}.role", role)
-            span.set_attribute(f"{LANGFUSE_GEN_AI_PROMPT}.{index}.content", content)
+            if role == "system":
+                system_parts.append({"type": "text", "content": content})
+                continue
+            input_messages.append({
+                "role": role or "user",
+                "parts": [{"type": "text", "content": content}],
+            })
+        if system_parts:
+            span.set_attribute(GEN_AI_SYSTEM_INSTRUCTIONS, _json_text(system_parts))
+        if input_messages:
+            span.set_attribute(GEN_AI_INPUT_MESSAGES, _json_text(input_messages))
         input_json = _json_text(messages)
         span.set_attribute(
             LANGFUSE_OBSERVATION_INPUT,
@@ -712,11 +713,13 @@ class CodexSpanBridge:
         )
 
         safe_completion = redact_completion(completion, config)
-        if emit_standard:
-            span.set_attribute(f"{GEN_AI_COMPLETION}.0.role", "assistant")
-            span.set_attribute(f"{GEN_AI_COMPLETION}.0.content", safe_completion)
-        span.set_attribute(f"{LANGFUSE_GEN_AI_COMPLETION}.0.role", "assistant")
-        span.set_attribute(f"{LANGFUSE_GEN_AI_COMPLETION}.0.content", safe_completion)
+        span.set_attribute(
+            GEN_AI_OUTPUT_MESSAGES,
+            _json_text([{
+                "role": "assistant",
+                "parts": [{"type": "text", "content": safe_completion}],
+            }]),
+        )
         if tool_calls:
             span.set_attribute(
                 GEN_AI_TOOL_CALLS,
@@ -766,9 +769,13 @@ class CodexSpanBridge:
             safe_reasoning = redact_completion(reasoning, config)
             reasoning_span.set_attribute(LANGFUSE_OBSERVATION_INPUT, "llm reasoning")
             reasoning_span.set_attribute(LANGFUSE_OBSERVATION_OUTPUT, safe_reasoning)
-            reasoning_span.set_attribute(f"{GEN_AI_COMPLETION}.0.role", "reasoning")
-            reasoning_span.set_attribute(f"{GEN_AI_COMPLETION}.0.is_reasoning", True)
-            reasoning_span.set_attribute(f"{GEN_AI_COMPLETION}.0.content", safe_reasoning)
+            reasoning_span.set_attribute(
+                GEN_AI_OUTPUT_MESSAGES,
+                _json_text([{
+                    "role": "reasoning",
+                    "parts": [{"type": "text", "content": safe_reasoning}],
+                }]),
+            )
             if usage["reasoning_output_tokens"]:
                 reasoning_span.set_attribute(
                     GEN_AI_USAGE_REASONING_TOKENS,
@@ -1183,6 +1190,49 @@ class CodexSpanBridge:
                     "codex.error.will_retry": will_retry,
                 },
             )
+
+    def record_external_runtime_failure(
+        self,
+        *,
+        failure_id: str,
+        round_id: int | None,
+        phase: str,
+        category: str,
+        summary: str,
+    ) -> None:
+        """Stamp the finalized external runtime failure on a trace span.
+
+        Prefers the current turn span; falls back to the long-lived team span
+        so a startup-phase failure (no turn span yet) is still correlated in
+        trace. Correlates the failed mailbox message, round result and logs
+        with the member round via ``failure_id`` / ``round_id``. No-op when no
+        recording span is available (observability is best-effort).
+        """
+        span = self._turn_span
+        if span is None or not span.is_recording():
+            # Startup failures happen before any turn span exists; fall back to
+            # the team span so the event is not lost from trace.
+            runtime = self._observability_runtime()
+            if runtime is None:
+                return
+            _tracer, _config, team_span = runtime
+            span = team_span
+            if not span.is_recording():
+                return
+        span.add_event(
+            "external_runtime.failed",
+            {
+                "external_runtime.failure_id": failure_id,
+                "external_runtime.round_id": round_id if round_id is not None else "",
+                "external_runtime.phase": phase,
+                "external_runtime.category": category,
+                "external_runtime.summary": summary,
+                "external_runtime.member_name": self._member_name,
+                "external_runtime.member_agent_id": self._member_agent_id,
+                "external_runtime.team_name": self._team_name,
+                "external_runtime.agent_kind": "codex",
+            },
+        )
 
     async def wait_for_native_observations(self, *, timeout_s: float = 1.0) -> None:
         """Allow rollout and fallback OTel exporters to flush after the stream."""

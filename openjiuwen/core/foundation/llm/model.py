@@ -2,7 +2,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 import asyncio
 import time
-from typing import Union, List, Optional, AsyncIterator, Type, Dict
+from typing import Union, List, Optional, AsyncIterator
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import build_error
@@ -21,6 +21,7 @@ from openjiuwen.core.foundation.llm.schema.generation_response import (
 )
 from openjiuwen.core.foundation.llm.model_clients.base_model_client import BaseModelClient
 from openjiuwen.core.runner.callback import trigger
+from openjiuwen.core.kv_cache.kv_cache_model_hook import KVCacheModelHook
 
 
 class Model:
@@ -121,23 +122,41 @@ class Model:
         Returns:
             AssistantMessage
         """
+        from openjiuwen.core.context_engine.context.compression_scope import (
+            stamp_context_compression_model_kwargs,
+        )
+
+        stamp_context_compression_model_kwargs(kwargs)
+
         # Identify this request for the whole callback chain (input event,
         # the client's own LLM_OUTPUT trigger, output event, error event) so
         # observers can attribute what they receive to this call and not to
         # another one running concurrently. See ``call_scope``.
-        with LlmCallScope():
-            return await self._client.invoke(
-                messages=messages,
-                stop=stop,
-                model=model,
-                tools=tools,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                output_parser=output_parser,
-                timeout=timeout,
-                **kwargs
+        with LlmCallScope(unified_completion=True):
+            model_config = getattr(self, "model_config", None)
+            runtime_lease = await KVCacheModelHook.begin(
+                self,
+                kwargs,
+                model or getattr(model_config, "model_name", None),
             )
+            succeeded = False
+            try:
+                result = await self._client.invoke(
+                    messages=messages,
+                    stop=stop,
+                    model=model,
+                    tools=tools,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    output_parser=output_parser,
+                    timeout=timeout,
+                    **kwargs
+                )
+                succeeded = True
+                return result
+            finally:
+                await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
 
     async def stream(
             self,
@@ -170,6 +189,11 @@ class Model:
         Yields:
             AssistantMessageChunk
         """
+        from openjiuwen.core.context_engine.context.compression_scope import (
+            stamp_context_compression_model_kwargs,
+        )
+
+        stamp_context_compression_model_kwargs(kwargs)
         first_chunk_timeout = self._resolve_stream_timeout("stream_first_chunk_timeout")
         idle_timeout = self._resolve_stream_timeout("stream_idle_timeout")
 
@@ -178,110 +202,110 @@ class Model:
         # below runs in its own ``asyncio.wait_for`` task, and such a task
         # copies the context, so an id bound inside a chunk callback would be
         # gone by the time the next chunk arrives. See ``call_scope``.
-        with LlmCallScope():
-            stream_iterable = self._client.stream(
-                messages=messages,
-                stop=stop,
-                model=model,
-                tools=tools,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                output_parser=output_parser,
-                timeout=timeout,
-                **kwargs
+        with LlmCallScope(unified_completion=True):
+            model_config = getattr(self, "model_config", None)
+            effective_model_name = model or getattr(model_config, "model_name", None)
+            runtime_lease = await KVCacheModelHook.begin(self, kwargs, effective_model_name)
+            succeeded = False
+            accumulated_chunk: AssistantMessageChunk | None = None
+            try:
+                stream_iterable = self._client.stream(
+                    messages=messages,
+                    stop=stop,
+                    model=model,
+                    tools=tools,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    output_parser=output_parser,
+                    timeout=timeout,
+                    **kwargs
+                )
+                stream_iterator = stream_iterable.__aiter__()
+                started_at = time.monotonic()
+                last_chunk_at = started_at
+                chunk_count = 0
+
+                while True:
+                    stage = "first_chunk" if chunk_count == 0 else "idle_chunk"
+                    next_timeout = first_chunk_timeout if chunk_count == 0 else idle_timeout
+
+                    try:
+                        if next_timeout is None:
+                            chunk = await stream_iterator.__anext__()
+                        else:
+                            chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=next_timeout)
+                    except StopAsyncIteration:
+                        succeeded = True
+                        break
+                    except asyncio.TimeoutError as exc:
+                        close = getattr(stream_iterator, "aclose", None) or getattr(stream_iterable, "aclose", None)
+                        if callable(close):
+                            await close()
+
+                        now = time.monotonic()
+                        total_elapsed_seconds = now - started_at
+                        wait_elapsed_seconds = now - (started_at if chunk_count == 0 else last_chunk_at)
+                        timeout_seconds = next_timeout if next_timeout is not None else 0
+                        model_provider = getattr(self.model_client_config, "client_provider", None)
+                        elapsed_label = "first_chunk_elapsed" if chunk_count == 0 else "idle_elapsed"
+                        error_detail = (
+                            f"stream frame timeout: stage={stage}, timeout={timeout_seconds}s, "
+                            f"chunk_count={chunk_count}, {elapsed_label}={wait_elapsed_seconds:.2f}s, "
+                            f"total_elapsed={total_elapsed_seconds:.2f}s, "
+                            f"model={effective_model_name or ''}"
+                        )
+                        from openjiuwen.core.runner.callback.events import LLMCallEvents
+                        await trigger(
+                            LLMCallEvents.LLM_CALL_ERROR,
+                            model_name=effective_model_name,
+                            model_provider=model_provider,
+                            is_stream=True,
+                            error=exc)
+                        llm_logger.error(
+                            "LLM stream timeout.",
+                            event_type=LogEventType.LLM_CALL_ERROR,
+                            model_name=effective_model_name,
+                            model_provider=model_provider,
+                            tools=tools,
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                            is_stream=True,
+                            exception=error_detail
+                        )
+                        raise build_error(
+                            StatusCode.MODEL_CALL_FAILED,
+                            error_msg=f"LLM stream timeout: {error_detail}"
+                        ) from exc
+
+                    chunk_count += 1
+                    last_chunk_at = time.monotonic()
+                    # A client (or an LLM_STREAM_OUTPUT transform callback ahead
+                    # of this frame) may yield something other than a message
+                    # chunk; only real chunks accumulate into the completion.
+                    if isinstance(chunk, AssistantMessageChunk):
+                        accumulated_chunk = (
+                            accumulated_chunk + chunk
+                            if accumulated_chunk is not None
+                            else chunk
+                        )
+                    yield chunk
+            finally:
+                await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
+
+            completed_message = (
+                AssistantMessage.model_validate(accumulated_chunk.model_dump())
+                if accumulated_chunk is not None
+                else AssistantMessage(content="")
             )
-            stream_iterator = stream_iterable.__aiter__()
-            started_at = time.monotonic()
-            last_chunk_at = started_at
-            chunk_count = 0
-            effective_model_name = model or getattr(self.model_config, "model_name", None)
-
-            while True:
-                stage = "first_chunk" if chunk_count == 0 else "idle_chunk"
-                next_timeout = first_chunk_timeout if chunk_count == 0 else idle_timeout
-
-                try:
-                    if next_timeout is None:
-                        chunk = await stream_iterator.__anext__()
-                    else:
-                        chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=next_timeout)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError as exc:
-                    close = getattr(stream_iterator, "aclose", None) or getattr(stream_iterable, "aclose", None)
-                    if callable(close):
-                        await close()
-
-                    now = time.monotonic()
-                    total_elapsed_seconds = now - started_at
-                    wait_elapsed_seconds = now - (started_at if chunk_count == 0 else last_chunk_at)
-                    timeout_seconds = next_timeout if next_timeout is not None else 0
-                    model_provider = getattr(self.model_client_config, "client_provider", None)
-                    elapsed_label = "first_chunk_elapsed" if chunk_count == 0 else "idle_elapsed"
-                    error_detail = (
-                        f"stream frame timeout: stage={stage}, timeout={timeout_seconds}s, "
-                        f"chunk_count={chunk_count}, {elapsed_label}={wait_elapsed_seconds:.2f}s, "
-                        f"total_elapsed={total_elapsed_seconds:.2f}s, "
-                        f"model={effective_model_name or ''}"
-                    )
-                    from openjiuwen.core.runner.callback.events import LLMCallEvents
-                    await trigger(
-                        LLMCallEvents.LLM_CALL_ERROR,
-                        model_name=effective_model_name,
-                        model_provider=model_provider,
-                        is_stream=True,
-                        error=exc)
-                    llm_logger.error(
-                        "LLM stream timeout.",
-                        event_type=LogEventType.LLM_CALL_ERROR,
-                        model_name=effective_model_name,
-                        model_provider=model_provider,
-                        tools=tools,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        is_stream=True,
-                        exception=error_detail
-                    )
-                    raise build_error(
-                        StatusCode.MODEL_CALL_FAILED,
-                        error_msg=f"LLM stream timeout: {error_detail}"
-                    ) from exc
-
-                chunk_count += 1
-                last_chunk_at = time.monotonic()
-                yield chunk
-
-    async def release(
-            self,
-            session_id: str,
-            messages: List,
-            messages_released_index: int,
-            *,
-            model: Optional[str] = None,
-            tools: Optional[List] = None,
-            tools_released_index: Optional[int] = None,
-    ) -> bool:
-        """Release model cache/resources if the underlying client supports it."""
-        release_fn = getattr(self._client, "release", None)
-        if release_fn is None:
-            return False
-        return await release_fn(
-            session_id=session_id,
-            messages=messages,
-            messages_released_index=messages_released_index,
-            model=model,
-            tools=tools,
-            tools_released_index=tools_released_index,
-        )
-
-    def supports_kv_cache_release(self) -> bool:
-        """Whether underlying client supports KV cache release."""
-        supports_fn = getattr(self._client, "supports_kv_cache_release", None)
-        if callable(supports_fn):
-            return bool(supports_fn())
-        return callable(getattr(self._client, "release", None))
+            from openjiuwen.core.runner.callback.events import LLMCallEvents
+            await trigger(
+                LLMCallEvents.LLM_STREAM_COMPLETED,
+                result=completed_message,
+                model_config=self.model_config,
+                model_client_config=self.model_client_config,
+            )
 
     def supports_kv_cache_affinity(self) -> bool:
         """Whether underlying client supports Ascend KV cache affinity actions."""
@@ -291,26 +315,6 @@ class Model:
         return all(
             callable(getattr(self._client, name, None))
             for name in ("evict_kvc", "offload_kvc", "prefetch_kvc")
-        )
-
-    def build_kv_cache_invoke_kwargs(
-            self,
-            *,
-            session: object = None,
-            enable_kv_cache_release: bool = False,
-    ) -> dict:
-        """Build extra kwargs for invoke/stream related to KV cache behavior.
-
-        For InferenceAffinity (vLLM):
-          - session_id: use session.get_session_id() if provided
-          - enable_cache_sharing: follow enable_kv_cache_release
-        """
-        build_fn = getattr(self._client, "build_kv_cache_invoke_kwargs", None)
-        if not callable(build_fn):
-            return {}
-        return build_fn(
-            session=session,
-            enable_kv_cache_release=enable_kv_cache_release,
         )
 
     def build_kv_cache_affinity_invoke_kwargs(
