@@ -824,18 +824,20 @@ class BrowserService:
             )
         command_path = Path(command).expanduser()
         if command_path.is_absolute():
-            if not command_path.is_file() or not os.access(command_path, os.X_OK):
-                raise RuntimeError(
-                    f"Playwright MCP command is not an executable file: {command_path}"
-                )
-            return str(command_path)
-        resolved = shutil.which(command)
+            resolved = str(command_path)
+        else:
+            resolved = shutil.which(command)
         if resolved is None:
             raise RuntimeError(
                 f"Playwright MCP command '{command}' was not found in PATH. "
                 "Install Node.js 20+ or configure an absolute executable path."
             )
-        return resolved
+        resolved_path = Path(os.path.abspath(resolved))
+        if not resolved_path.is_file() or not os.access(resolved_path, os.X_OK):
+            raise RuntimeError(
+                f"Playwright MCP command is not an executable file: {resolved_path}"
+            )
+        return str(resolved_path)
 
     async def ensure_runtime_ready(self) -> None:
         if self._task_binding_ref_count <= 0:
@@ -850,7 +852,7 @@ class BrowserService:
                 self._browser_agent = None
             return
 
-        self._validate_mcp_command()
+        self.mcp_cfg.params["command"] = self._validate_mcp_command()
 
         from .browser_tools import ensure_browser_runtime_client_patch
 
