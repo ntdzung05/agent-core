@@ -31,8 +31,11 @@ from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
     BROWSER_TASK_STATE_KEY,
     BROWSER_TOOL_MEMORY_METADATA_KEY,
+    BROWSER_WORKING_CONTEXT_STATE_KEY,
     BROWSER_WORKING_MEMORY_RECORD_BEGIN,
     BROWSER_WORKING_MEMORY_RECORD_END,
+    BrowserFailedAction,
+    BrowserPendingAssessment,
     BrowserWorkingContextStore,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
@@ -197,6 +200,11 @@ def _inject(
     window = ContextWindow(context_messages=list(context.messages))
     _, rendered = _run(processor.on_get_context_window(context, window))
     return rendered
+
+
+def _working_context_payload(prompt: str) -> tuple[str, dict[str, Any]]:
+    body = prompt.split("\n", 2)[2].rsplit("\n</browser_working_context>", 1)[0]
+    return body, json.loads(body)
 
 
 def test_model_memory_survives_and_internal_update_is_not_user_facing() -> None:
@@ -436,7 +444,7 @@ def test_failed_equivalent_action_requires_recovery_justification(
     assert state.failed_actions[0].failure_count == 1
     prompt = BrowserWorkingContextStore(config).render_and_consume_one_step(session)
     assert '"loop_guard"' in prompt
-    assert '"failure_count": 1' in prompt
+    assert _working_context_payload(prompt)[1]["loop_guard"][0]["failure_count"] == 1
     assert "Execute browser tool batch: browser_scroll" in prompt
     assert "No previously unseen result appeared" in prompt
     assert state.failed_actions[0].action_signature not in prompt
@@ -866,10 +874,10 @@ def test_one_model_record_aggregates_multiple_tool_results() -> None:
     ]
     assert len(state.actions_requiring_assessment) == 2
     prompt = _inject(BrowserWorkingContextProcessor(config), context).context_messages[-1].content
-    assert '"required_now": [' in prompt
+    assert _working_context_payload(prompt)[1]["required_now"] == ["action_assessment"]
     assert '"action_assessment"' in prompt
     assert '"previous_batch"' in prompt
-    assert '"tool_call_count": 2' in prompt
+    assert _working_context_payload(prompt)[1]["previous_batch"]["tool_call_count"] == 2
     assert "Execute browser tool batch: browser_navigate, browser_probe_cards" in prompt
 
     assessment_response = _response(
@@ -1082,15 +1090,14 @@ def test_processor_guidance_defines_the_conditional_delta_contract() -> None:
     assert "never place it in tool_calls" in prompt
     assert BROWSER_WORKING_MEMORY_RECORD_BEGIN in prompt
     assert BROWSER_WORKING_MEMORY_RECORD_END in prompt
-    assert '"required_now": []' in prompt
+    assert _working_context_payload(prompt)[1]["required_now"] == []
     assert '"required_if_calling_tools"' in prompt
     assert '"memory"' in prompt
     assert '"add_failures"' in prompt
     assert '"add_key_facts"' in prompt
     assert '"action_assessment"' in prompt
     assert '"batch_intent"' in prompt
-    assert '"failures": []' in prompt
-    assert '"key_facts": []' in prompt
+    assert _working_context_payload(prompt)[1]["memory"] == {"failures": [], "key_facts": []}
     assert '"recent_durable_steps"' not in prompt
     assert "<browser_context_update>" not in prompt
 
@@ -1122,6 +1129,92 @@ def test_processor_renders_chinese_guidance_with_stable_schema_keys() -> None:
     assert '"required_now"' in prompt
     assert '"required_if_calling_tools"' in prompt
     assert '"memory"' in prompt
+
+
+def test_working_context_is_valid_json_within_configured_limit() -> None:
+    config = BrowserWorkingContextProcessorConfig(max_prompt_chars=2_000)
+    session = _FakeSession()
+    store = BrowserWorkingContextStore(config)
+    store.begin_request(session, "Follow up " + ("q" * 2_000))
+    session.update_state(
+        {
+            BROWSER_TASK_STATE_KEY: {
+                "task_id": "bounded-task",
+                "goal": "g" * 2_000,
+                "status": "in_progress",
+                "required_evidence_slots": [
+                    {"entity": f"entity-{index}", "variant": "default", "field": f"field-{index}"}
+                    for index in range(20)
+                ],
+                "evidence_slots": [
+                    {
+                        "entity": f"entity-{index}",
+                        "variant": "default",
+                        "field": f"field-{index}",
+                        "status": "present",
+                        "value": "v" * 1_000,
+                        "source": "https://example.test/" + ("s" * 1_000),
+                    }
+                    for index in range(20)
+                ],
+                "blockers": ["b" * 1_000 for _ in range(10)],
+                "recent_actions": [{"semantic_delta": "d" * 1_000} for _ in range(10)],
+            }
+        }
+    )
+
+    prompt = _inject(BrowserWorkingContextProcessor(config), _FakeContext(session)).context_messages[-1].content
+    body, payload = _working_context_payload(prompt)
+
+    assert len(body) <= config.max_prompt_chars
+    assert payload["request"]["text"].startswith("Follow up")
+    assert payload["task"]["task_id"] == "bounded-task"
+
+
+@pytest.mark.parametrize("limit", [2_000, 4_000, 8_000])
+def test_bounded_context_preserves_batch_contract_and_durable_state(limit: int) -> None:
+    config = BrowserWorkingContextProcessorConfig(max_prompt_chars=limit)
+    session = _FakeSession()
+    store = BrowserWorkingContextStore(config)
+    state = store.begin_request(session, "Read the results " + "q" * 2_000)
+    state.current.key_facts = ["verified fact " + "f" * 1_000 for _ in range(20)]
+    state.current.failures = ["failed action " + "x" * 1_000 for _ in range(20)]
+    state.actions_requiring_assessment = [
+        BrowserPendingAssessment(
+            tool_call_id=f"call-{index}",
+            tool_name="browser_evaluate",
+            action_signature=f"signature-{index}",
+            intent="Inspect results " + "i" * 2_000,
+            expected_outcome="Visible evidence " + "e" * 2_000,
+        )
+        for index in range(4)
+    ]
+    state.failed_actions = [
+        BrowserFailedAction(
+            action_signature="failed-signature",
+            failure_count=2,
+            tool_name="browser_evaluate",
+            last_reason="No progress " + "r" * 2_000,
+        )
+    ]
+    store.save(session, state)
+    session.update_state({BROWSER_TASK_STATE_KEY: {"status": "partial", "goal": "g" * 2_000}})
+
+    prompt = store.render_and_consume_one_step(session)
+    body, payload = _working_context_payload(prompt)
+
+    assert len(body) <= limit
+    assert payload["truncated"] is True
+    assert payload["runtime_directive"] == "return_partial_or_blocked"
+    assert payload["required_now"] == ["action_assessment"]
+    assert payload["required_if_calling_tools"] == ["batch_intent"]
+    assert payload["previous_batch"]["tool_call_count"] == 4
+    assert payload["previous_batch"]["intent"].startswith("Inspect results")
+    assert payload["memory"]["key_facts"][0].startswith("verified fact")
+    assert payload["memory"]["failures"][0].startswith("failed action")
+    assert payload["loop_guard"][0]["failure_count"] == 2
+    assert "failed-signature" not in prompt
+    assert store.load(session) == state
 
 
 def test_history_limit_discards_old_steps_but_preserves_durable_memory() -> None:
@@ -1212,7 +1305,7 @@ def test_new_agent_invocation_resets_completed_session_memory() -> None:
     )
     assert "Now check its tracking link" in prompt
     assert "Order 123 is shipped." not in prompt
-    assert '"request": "Now check its tracking link"' in prompt
+    assert _working_context_payload(prompt)[1]["request"]["text"] == "Now check its tracking link"
     assert '"memory"' in prompt
 
 
@@ -1411,7 +1504,7 @@ def test_checkpointed_state_is_reset_by_a_reconstructed_agent_invocation() -> No
         .context_messages[-1]
         .content
     )
-    assert '"request": "Track it"' in prompt
+    assert _working_context_payload(prompt)[1]["request"]["text"] == "Track it"
     assert "Order 123 was found." not in prompt
     assert '"recent_durable_steps"' not in prompt
 
@@ -1482,6 +1575,51 @@ def test_processor_replaces_only_its_own_ephemeral_message() -> None:
     assert "<browser_working_context>" in rendered.context_messages[0].content
 
 
+def test_processor_runtime_projection_ignores_legacy_model_memory() -> None:
+    processor = BrowserWorkingContextProcessor(BrowserWorkingContextProcessorConfig(runtime_projection_only=True))
+    session = _FakeSession()
+    session.update_state(
+        {
+            BROWSER_WORKING_CONTEXT_STATE_KEY: {
+                "active_request": "stale request",
+                "current": {
+                    "key_facts": ["stale model fact"],
+                    "important_information": ["stale model note"],
+                },
+                "one_step_content": [
+                    {
+                        "tool_name": "browser_evaluate",
+                        "durable_content": "stale tool evidence",
+                    }
+                ],
+            },
+            BROWSER_TASK_STATE_KEY: {
+                "task_id": "task-runtime",
+                "goal": "Return the current page title",
+                "status": "in_progress",
+                "required_fields": ["title"],
+                "field_coverage": [],
+                "structured_evidence": [],
+                "blockers": [],
+                "recent_actions": [],
+            },
+        }
+    )
+    context = _FakeContext(session)
+
+    rendered = _inject(processor, context)
+    _, payload = _working_context_payload(rendered.context_messages[-1].content)
+
+    assert payload["request"]["text"] == "Return the current page title"
+    assert "model_notes" not in payload
+    assert "retained_tool_evidence" not in payload
+    assert "next_tool_result" not in payload
+    assert "memory" not in payload
+    assert "required_now" not in payload
+    assert BROWSER_WORKING_MEMORY_RECORD_BEGIN not in rendered.context_messages[-1].content
+    assert session.get_state(BROWSER_WORKING_CONTEXT_STATE_KEY)["one_step_content"]
+
+
 def test_processor_projects_runtime_task_state_before_current_page_state() -> None:
     config = BrowserWorkingContextProcessorConfig()
     processor = BrowserWorkingContextProcessor(config)
@@ -1537,7 +1675,150 @@ def test_processor_projects_runtime_task_state_before_current_page_state() -> No
 
     assert rendered.context_messages[-1] is current_state
     prompt = rendered.context_messages[-2].content
-    assert '"runtime_directive": "replan_before_browser_action"' in prompt
-    assert '"field_coverage": [' in prompt
-    assert '"semantic_delta": "no_progress"' in prompt
+    assert '"runtime_directive":"replan_before_browser_action"' in prompt
+    assert '"requirements":{' in prompt
+    assert '"field":"price"' in prompt
+    assert '"semantic_delta":"no_progress"' in prompt
     assert "script_exploration" in prompt
+
+
+def test_semantic_observation_closes_sort_evidence_before_replan_gate() -> None:
+    session = _FakeSession()
+    session.update_state(
+        {
+            BROWSER_TASK_STATE_KEY: {
+                "task_id": "sort-task",
+                "goal": "按销量排序并返回第一条商品标题",
+                "status": "replan_required",
+                "current_phase": "filtering",
+                "phases": {
+                    "filtering": {
+                        "status": "replan_required",
+                        "attempts": 2,
+                        "budget": 20,
+                    },
+                    "extraction": {"status": "pending", "attempts": 0, "budget": 20},
+                },
+                "required_fields": ["sort_state", "title"],
+                "required_evidence_slots": [{"entity": "product", "variant": "default", "field": "sort_state"}],
+                "field_coverage": [],
+                "structured_evidence": [],
+                "evidence_slots": [],
+                "blockers": [],
+                "replan_required": True,
+                "replan_trial_pending": True,
+                "trial_strategy": "click sales sort",
+                "recent_actions": [
+                    {
+                        "seq": 2,
+                        "phase": "filtering",
+                        "action_class": "filtering",
+                        "outcome": "timeout",
+                        "outcome_status": "ambiguous",
+                        "semantic_delta": "pending",
+                    }
+                ],
+            }
+        }
+    )
+    progress = {
+        "revision": 1,
+        "progress": "progress",
+        "observable_progress": True,
+        "changed_fields": ["url", "selected_filters", "first_result_text"],
+        "semantic_state": {
+            "generation_id": "g4",
+            "url": "https://shop.example/search?sort=sales",
+            "selected_filters": [{"key": "sort", "value": "销量从高到低"}],
+            "first_result_text": "Mechanical Keyboard 1000 sold",
+        },
+    }
+
+    recovered = BrowserWorkingContextStore.sync_semantic_progress(session, progress)
+
+    state = session.get_state(BROWSER_TASK_STATE_KEY)
+    assert recovered is True
+    assert "sort_state" in state["field_coverage"]
+    assert state["evidence_slots"][0]["value"] == "销量从高到低"
+    assert state["evidence_slots"][0]["generation"] == "g4"
+    assert state["recent_actions"][-1]["outcome_status"] == "success_after_observation"
+    assert state["phases"]["filtering"]["status"] == "completed"
+    assert state["replan_required"] is False
+
+
+def test_changed_first_result_confirms_successful_sort_click() -> None:
+    session = _FakeSession()
+    session.update_state(
+        {
+            BROWSER_TASK_STATE_KEY: {
+                "task_id": "sort-fallback",
+                "goal": "按销量排序",
+                "status": "in_progress",
+                "required_fields": ["sort_state"],
+                "field_coverage": [],
+                "structured_evidence": [],
+                "evidence_slots": [],
+                "required_evidence_slots": [],
+                "recent_actions": [
+                    {
+                        "outcome_status": "success",
+                        "semantic_delta": "pending",
+                        "target_summary": json.dumps(
+                            {
+                                "tool": "browser_click",
+                                "target_id": "t-sort-sales",
+                                "element": "销量优先",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            }
+        }
+    )
+
+    BrowserWorkingContextStore.sync_semantic_progress(
+        session,
+        {
+            "revision": 1,
+            "progress": "progress",
+            "observable_progress": True,
+            "changed_fields": ["first_result_text"],
+            "semantic_state": {
+                "generation_id": "g5",
+                "url": "https://shop.example/search",
+                "first_result_text": "Top selling keyboard",
+                "selected_filters": [],
+            },
+        },
+    )
+
+    state = session.get_state(BROWSER_TASK_STATE_KEY)
+    evidence = state["structured_evidence"][-1]
+    assert evidence["values"]["sort_state"] == "销量"
+    assert evidence["provenance"]["sort_state"]["selection_source"] == "first_result_change"
+    assert evidence["provenance"]["sort_state"]["selector"] == "t-sort-sales"
+
+
+def test_changed_first_result_does_not_confirm_an_unrelated_click() -> None:
+    state = {
+        "recent_actions": [
+            {
+                "outcome_status": "success",
+                "target_summary": json.dumps(
+                    {
+                        "tool": "browser_click",
+                        "target_id": "t-product",
+                        "element": "Mechanical Keyboard",
+                    }
+                ),
+            }
+        ]
+    }
+
+    inferred = BrowserWorkingContextStore._sort_from_changed_results(
+        state,
+        {"changed_fields": ["first_result_text"]},
+    )
+
+    assert inferred is None

@@ -72,8 +72,9 @@ _READ_ONLY_CARD_TARGET_FIELDS = frozenset(
         "sort_state",
     }
 )
-_MAX_PUBLIC_INTERACTIVES = 40
-_MAX_PUBLIC_CARDS = 20
+_DEFAULT_CARD_FIELDS = frozenset({"title", "price", "rating", "source", "summary", "primary_link", "href"})
+_MAX_PUBLIC_INTERACTIVES = 20
+_MAX_PUBLIC_CARDS = 8
 _MAX_TARGET_HISTORY = 1024
 
 
@@ -133,6 +134,8 @@ class BrowserTarget:
     clickable: bool = False
     extractable: bool = False
     field_name: str = ""
+    selected: bool = False
+    selected_source: str = ""
 
     @property
     def generation_id(self) -> str:
@@ -168,6 +171,10 @@ class BrowserTarget:
         if self.extractable:
             result["extractable"] = True
             result["read_only"] = True
+        if self.selected:
+            result["selected"] = True
+            if self.selected_source:
+                result["selected_source"] = self.selected_source
         return result
 
 
@@ -185,6 +192,7 @@ class BrowserPageState:
         self.url = ""
         self.title = ""
         self.field_coverage: set[str] = set()
+        self.requested_fields: set[str] = set()
         self.blockers: set[str] = set()
         self.reference_generations: Dict[str, int] = {}
         self.selector_generations: Dict[str, int] = {}
@@ -303,8 +311,11 @@ class BrowserPageState:
     def _compact_card_fields(self, card: Mapping[str, Any]) -> Dict[str, Any]:
         statuses_value = card.get("field_status")
         statuses = statuses_value if isinstance(statuses_value, Mapping) else {}
+        visible_fields = _DEFAULT_CARD_FIELDS | self.requested_fields
         compact: Dict[str, Any] = {}
         for field_name in _CARD_SEMANTIC_FIELD_NAMES + CARD_EVIDENCE_FIELDS:
+            if field_name in CARD_EVIDENCE_FIELDS and field_name not in visible_fields:
+                continue
             field_value = card.get(field_name)
             if field_value in (None, "", [], {}):
                 continue
@@ -314,12 +325,14 @@ class BrowserPageState:
                 field_value if isinstance(field_value, (bool, int, float)) else _compact_text(field_value)
             )
         missing_fields = sorted(
-            field_name for field_name in CARD_EVIDENCE_FIELDS if statuses.get(field_name) in {"missing", "unknown"}
+            field_name
+            for field_name in CARD_EVIDENCE_FIELDS
+            if field_name in visible_fields and statuses.get(field_name) in {"missing", "unknown"}
         )
         compact_statuses = {
             field_name: str(statuses[field_name])
             for field_name in CARD_EVIDENCE_FIELDS
-            if statuses.get(field_name) in {"present", "missing", "unknown"}
+            if field_name in visible_fields and statuses.get(field_name) in {"present", "missing", "unknown"}
         }
         if compact_statuses:
             compact["field_status"] = compact_statuses
@@ -327,6 +340,8 @@ class BrowserPageState:
         if isinstance(provenance_value, Mapping):
             compact_provenance: Dict[str, Dict[str, Any]] = {}
             for field_name in CARD_EVIDENCE_FIELDS:
+                if field_name not in visible_fields:
+                    continue
                 item = provenance_value.get(field_name)
                 if not isinstance(item, Mapping):
                     continue
@@ -405,6 +420,13 @@ class BrowserPageState:
             normalized = str(field_name or "").strip()
             if normalized:
                 self.field_coverage.add(normalized)
+
+    def set_requested_fields(self, fields: Iterable[str]) -> None:
+        """Set task-scoped fields used to keep model-facing cards compact."""
+
+        self.requested_fields = {
+            str(field_name or "").strip() for field_name in fields if str(field_name or "").strip()
+        }
 
     def resolve_target(
         self,
@@ -611,6 +633,18 @@ class BrowserPageState:
             "blockers": sorted(self.blockers),
         }
 
+    def export_summary(self) -> Dict[str, Any]:
+        """Return PageState identity without duplicating cards or interactives."""
+
+        return {
+            "page_id": self.page_id,
+            "generation_id": self.generation_id,
+            "url": self.url,
+            "title": self.title,
+            "field_coverage": sorted(self.field_coverage),
+            "blockers": sorted(self.blockers),
+        }
+
     def _register_probe_target(
         self,
         item: Dict[str, Any],
@@ -655,6 +689,8 @@ class BrowserPageState:
             enabled=bool(item.get("enabled", not item.get("disabled", False))),
             actionable=bool(item.get("actionable", False)),
             clickable=bool(item.get("clickable", False)),
+            selected=bool(item.get("selected", False)),
+            selected_source=str(item.get("selected_source") or "")[:40],
         )
         if selector:
             self.selector_generations[selector] = self.generation
@@ -682,6 +718,8 @@ class BrowserPageState:
         target.enabled = bool(item.get("enabled", not item.get("disabled", False)))
         target.actionable = bool(item.get("actionable", False))
         target.clickable = bool(item.get("clickable", False))
+        target.selected = bool(item.get("selected", False))
+        target.selected_source = str(item.get("selected_source") or "")[:40]
 
     def _register_primary_link_target(
         self,
@@ -725,6 +763,8 @@ class BrowserPageState:
         selector_metadata = selector_metadata if isinstance(selector_metadata, Mapping) else {}
         registered: Dict[str, Dict[str, Any]] = {}
         for field_name in _READ_ONLY_CARD_TARGET_FIELDS:
+            if field_name not in self.requested_fields:
+                continue
             if field_status.get(field_name) != "present":
                 continue
             provenance_entry = field_provenance.get(field_name)

@@ -67,6 +67,17 @@ _WORKING_MEMORY_DELTA_SHAPE = (
     '"reason":"..."},"batch_intent":{"intent":"...","expected_outcome":"...",'
     '"recovery_justification":"..."},"add_failures":["..."],"add_key_facts":["..."]}'
 )
+_RUNTIME_CONTEXT_INSTRUCTIONS = {
+    "en": (
+        "Runtime-owned browser context. Requirements, evidence, blockers, status, and recent semantic "
+        "changes are authoritative. Choose the next strategy or answer concisely; do not echo this "
+        "context or repeat an action that made no progress."
+    ),
+    "cn": (
+        "这是 runtime 维护的浏览器上下文。请求字段、证据、阻断项、状态和最近语义变化均为权威信息。"
+        "请选择下一步策略或简洁作答；不要复述上下文，也不要重复没有产生进展的动作。"
+    ),
+}
 _EPHEMERAL_USER_MESSAGE_NAMES = frozenset(
     {
         "browser_working_context",
@@ -91,6 +102,7 @@ class BrowserWorkingContextConfig(BaseModel):
     max_item_chars: int = Field(default=1_000, ge=128)
     max_one_step_chars: int = Field(default=8_000, ge=256)
     max_prompt_chars: int = Field(default=8_000, ge=2_000)
+    runtime_projection_only: bool = False
 
 
 class BrowserWorkingMemory(BaseModel):
@@ -664,14 +676,35 @@ class BrowserWorkingContextStore:
     def render_and_consume_one_step(self, session: Any) -> str:
         """Render one compact projection and expire next-step-only content."""
 
-        state = self.load(session)
-        one_step_content = list(state.one_step_content)
+        state = BrowserWorkingContextState() if self.config.runtime_projection_only else self.load(session)
+        one_step_content = [] if self.config.runtime_projection_only else list(state.one_step_content)
         if one_step_content:
             state.one_step_content = []
             self.save(session, state)
 
-        instructions = _WORKING_CONTEXT_INSTRUCTIONS[self.config.language] + _WORKING_MEMORY_DELTA_SHAPE
         task_state = self.load_task_state(session)
+        request_text = state.active_request or str(task_state.get("goal") or task_state.get("task") or "")
+        request_kind = state.request_kind
+        if not state.active_request and int(task_state.get("resume_count") or 0) > 0:
+            request_kind = "follow_up"
+        rendered_state = {
+            "request": {"kind": request_kind, "text": _bounded_text(request_text, 1_000)},
+            "task": self._project_task_state(task_state),
+            "runtime_directive": self._runtime_directive(task_state),
+            "recent_actions": list(task_state.get("recent_actions") or [])[-self.config.max_recent_steps :],
+        }
+        if self.config.runtime_projection_only:
+            instructions = _RUNTIME_CONTEXT_INSTRUCTIONS[self.config.language]
+        else:
+            instructions = _WORKING_CONTEXT_INSTRUCTIONS[self.config.language] + _WORKING_MEMORY_DELTA_SHAPE
+            rendered_state.update(self._project_working_memory(state, one_step_content))
+        body = self._serialize_prompt_payload(rendered_state)
+        return f"<browser_working_context>\n{instructions}\n{body}\n</browser_working_context>"
+
+    def _project_working_memory(
+        self, state: BrowserWorkingContextState, one_step_content: list[BrowserToolMemory]
+    ) -> Dict[str, Any]:
+        """Project batch bookkeeping separately from runtime-owned task truth."""
         assessment_actions = state.actions_requiring_assessment
         previous_batch = None
         if assessment_actions:
@@ -693,19 +726,8 @@ class BrowserWorkingContextStore:
         rendered_state = {
             "required_now": ["action_assessment"] if assessment_actions else [],
             "required_if_calling_tools": ["batch_intent"],
-            "request": state.active_request,
-            "request_context": {
-                "sequence": state.request_sequence,
-                "kind": state.request_kind,
-            },
             "memory": state.current.model_dump(mode="json"),
         }
-        if task_state:
-            rendered_state["task_state"] = self._project_task_state(task_state)
-            rendered_state["runtime_directive"] = self._runtime_directive(task_state)
-            recent_actions = list(task_state.get("recent_actions") or [])[-self.config.max_recent_steps :]
-            if recent_actions:
-                rendered_state["recent_actions"] = recent_actions
         if previous_batch is not None:
             rendered_state["previous_batch"] = previous_batch
         if one_step_content:
@@ -719,11 +741,7 @@ class BrowserWorkingContextStore:
                 action.model_dump(mode="json", exclude={"action_signature"})
                 for action in state.failed_actions[-min(self.config.max_list_items, 5) :]
             ]
-        body = _bounded_text(
-            json.dumps(rendered_state, ensure_ascii=False, indent=2),
-            self.config.max_prompt_chars,
-        )
-        return f"<browser_working_context>\n{instructions}\n{body}\n</browser_working_context>"
+        return rendered_state
 
     def _compact_retained_tool_evidence(self, steps: Iterable[BrowserStepRecord]) -> list[Dict[str, Any]]:
         evidence: list[Dict[str, Any]] = []
@@ -743,6 +761,113 @@ class BrowserWorkingContextStore:
                     }
                 )
         return evidence[-self.config.max_recent_steps :]
+
+    def _serialize_prompt_payload(self, value: Dict[str, Any]) -> str:
+        """Serialize a bounded projection without ever truncating JSON text."""
+
+        payload = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(body) <= self.config.max_prompt_chars:
+            return body
+
+        payload["truncated"] = True
+        payload.pop("new_tool_context", None)
+        payload.pop("recent_tool_context", None)
+        notes = payload.get("memory")
+        if isinstance(notes, dict):
+            payload["memory"] = {
+                key: [_bounded_text(item, 240) for item in list(items or [])[-4:]] for key, items in notes.items()
+            }
+        payload["recent_actions"] = list(payload.get("recent_actions") or [])[-3:]
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(body) <= self.config.max_prompt_chars:
+            return body
+
+        task = payload.get("task")
+        task = task if isinstance(task, dict) else {}
+        requirements = task.get("requirements")
+        requirements = requirements if isinstance(requirements, dict) else {}
+        fallback = {
+            "request": payload.get("request") or {},
+            "task": {
+                "task_id": task.get("task_id"),
+                "goal": _bounded_text(task.get("goal"), 600),
+                "status": task.get("status", "in_progress"),
+                "current_phase": task.get("current_phase"),
+                "requirements": {
+                    "missing": list(requirements.get("missing") or [])[:12],
+                    "unavailable": list(requirements.get("unavailable") or [])[:8],
+                    "evidence": list(requirements.get("evidence") or [])[-6:],
+                },
+                "blockers": list(task.get("blockers") or [])[:6],
+                "last_page": task.get("last_page") or {},
+            },
+            "runtime_directive": payload.get("runtime_directive", "continue"),
+            "recent_actions": list(payload.get("recent_actions") or [])[-2:],
+            "truncated": True,
+        }
+        self._retain_batch_context(payload, fallback)
+        body = json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+        if len(body) <= self.config.max_prompt_chars:
+            return body
+
+        fallback["task"]["requirements"]["evidence"] = []
+        fallback["task"]["requirements"]["missing"] = list(requirements.get("missing") or [])[:6]
+        fallback["task"]["requirements"]["unavailable"] = list(requirements.get("unavailable") or [])[:4]
+        fallback["task"]["blockers"] = [_bounded_text(item, 160) for item in list(task.get("blockers") or [])[:4]]
+        fallback["task"].pop("last_page", None)
+        fallback["recent_actions"] = []
+        body = json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+        if len(body) <= self.config.max_prompt_chars:
+            return body
+
+        minimal = {
+            "request": {
+                "kind": (payload.get("request") or {}).get("kind", "initial"),
+                "text": _bounded_text((payload.get("request") or {}).get("text"), 500),
+            },
+            "task": {
+                "task_id": task.get("task_id"),
+                "goal": _bounded_text(task.get("goal"), 500),
+                "status": task.get("status", "in_progress"),
+                "requirements": {
+                    "missing": list(requirements.get("missing") or [])[:4],
+                },
+            },
+            "runtime_directive": payload.get("runtime_directive", "continue"),
+            "truncated": True,
+        }
+        self._retain_batch_context(payload, minimal)
+        # Bound the structure itself, including model-authored batch text. Keep
+        # the assessment requirements in every fallback; slicing serialized JSON
+        # could hide those requirements or produce an invalid prompt payload.
+        for item_limit, text_limit in ((2, 160), (1, 80), (1, 24)):
+            bounded = self._bound_prompt_values(minimal, item_limit, text_limit)
+            body = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
+            if len(body) <= self.config.max_prompt_chars:
+                break
+        return body
+
+    @staticmethod
+    def _retain_batch_context(source: Dict[str, Any], target: Dict[str, Any]) -> None:
+        for key in ("required_now", "required_if_calling_tools", "previous_batch", "memory", "loop_guard"):
+            if key in source:
+                target[key] = source[key]
+
+    @classmethod
+    def _bound_prompt_values(cls, value: Any, item_limit: int, text_limit: int) -> Any:
+        if isinstance(value, str):
+            return value[:text_limit]
+        if isinstance(value, list):
+            return [cls._bound_prompt_values(item, item_limit, text_limit) for item in value[:item_limit]]
+        if isinstance(value, dict):
+            return {
+                key: item
+                if key in {"kind", "status", "runtime_directive"}
+                else cls._bound_prompt_values(item, item_limit, text_limit)
+                for key, item in value.items()
+            }
+        return value
 
     @staticmethod
     def load_task_state(session: Any) -> Dict[str, Any]:
@@ -770,6 +895,7 @@ class BrowserWorkingContextStore:
 
         state["semantic_revision"] = revision
         cls._merge_semantic_observation(state, progress)
+        cls._merge_semantic_evidence(state, progress)
         if str(state.get("status") or "").strip().lower() in _TERMINAL_TASK_STATUSES:
             session.update_state({BROWSER_TASK_STATE_KEY: state})
             return False
@@ -778,6 +904,7 @@ class BrowserWorkingContextStore:
             state.get("replan_trial_pending")
             and (progress.get("observable_progress") is True or progress_name == "progress")
         )
+        recovered = cls._reconcile_observed_action(state, progress) or recovered
         cls._apply_replan_observation(state, progress, recovered=recovered)
         session.update_state({BROWSER_TASK_STATE_KEY: state})
         return recovered
@@ -794,6 +921,7 @@ class BrowserWorkingContextStore:
             "repeated_filter_state",
             "replan_required",
             "replan_reason",
+            "changed_fields",
         )
         for key in semantic_keys:
             if key in progress:
@@ -801,11 +929,6 @@ class BrowserWorkingContextStore:
         state["semantic_progress"] = semantic_progress
         semantic_state = progress.get("semantic_state")
         if isinstance(semantic_state, dict):
-            coverage = semantic_state.get("field_coverage")
-            if isinstance(coverage, list):
-                merged_coverage = set(state.get("field_coverage") or [])
-                merged_coverage.update(str(item) for item in coverage if str(item).strip())
-                state["field_coverage"] = sorted(merged_coverage)
             url = str(semantic_state.get("url") or "").strip()
             if url:
                 last_page = state.setdefault("last_page", {})
@@ -817,6 +940,315 @@ class BrowserWorkingContextStore:
             last_action = recent_actions[-1]
             if isinstance(last_action, dict) and last_action.get("semantic_delta") in (None, "", "pending"):
                 last_action["semantic_delta"] = progress_name
+
+    @staticmethod
+    def _merge_semantic_evidence(state: Dict[str, Any], progress: Dict[str, Any]) -> None:
+        semantic_state = progress.get("semantic_state")
+        if not isinstance(semantic_state, dict):
+            return
+        required_fields = {str(field) for field in state.get("required_fields") or []}
+        selected_filters = semantic_state.get("selected_filters")
+        selected_filters = selected_filters if isinstance(selected_filters, list) else []
+        if "sort_state" in required_fields:
+            sort_candidates = []
+            for item in selected_filters:
+                if not isinstance(item, dict):
+                    continue
+                filter_text = f"{item.get('key', '')} {item.get('value', '')}".lower()
+                if any(
+                    token in filter_text for token in ("sort", "order", "sales", "销量", "排序", "价格", "最新", "综合")
+                ):
+                    sort_candidates.append(item)
+            if sort_candidates:
+                selected = sort_candidates[-1]
+                value = str(selected.get("value") or selected.get("key") or "")[:500]
+                BrowserWorkingContextStore._append_semantic_evidence(
+                    state,
+                    field_name="sort_state",
+                    value=value,
+                    semantic_state=semantic_state,
+                    selection_source=str(selected.get("source") or "semantic_state"),
+                )
+            else:
+                changed_sort = BrowserWorkingContextStore._sort_from_changed_results(state, progress)
+                if changed_sort is not None:
+                    value, selector = changed_sort
+                    BrowserWorkingContextStore._append_semantic_evidence(
+                        state,
+                        field_name="sort_state",
+                        value=value,
+                        semantic_state=semantic_state,
+                        selection_source="first_result_change",
+                        selector=selector,
+                    )
+
+        goal = str(state.get("goal") or state.get("task") or "").lower()
+        commerce_requested = any(
+            token in goal for token in ("cart", "basket", "add to cart", "购物车", "加购", "加入购物车")
+        )
+        feedback = semantic_state.get("action_feedback") or semantic_state.get("commerce_state")
+        if commerce_requested and isinstance(feedback, list) and feedback:
+            value = "; ".join(
+                str(item.get("value") or "")
+                for item in feedback[:4]
+                if isinstance(item, dict) and str(item.get("value") or "").strip()
+            )[:500]
+            if value:
+                BrowserWorkingContextStore._append_semantic_evidence(
+                    state,
+                    field_name="action_confirmation",
+                    value=value,
+                    semantic_state=semantic_state,
+                )
+
+    @staticmethod
+    def _append_semantic_evidence(
+        state: Dict[str, Any],
+        *,
+        field_name: str,
+        value: str,
+        semantic_state: Dict[str, Any],
+        selection_source: str = "",
+        selector: str = "",
+    ) -> None:
+        generation = str(semantic_state.get("generation_id") or "")
+        source = str(semantic_state.get("url") or state.get("last_page", {}).get("url") or "")
+        record = {
+            "kind": "semantic_observation",
+            "generation_id": generation,
+            "fields": [field_name],
+            "values": {field_name: value},
+            "provenance": {
+                field_name: {
+                    "source": source or "browser_semantic_state",
+                    "raw_text": value[:600],
+                    "generation_id": generation,
+                }
+            },
+        }
+        provenance = record["provenance"][field_name]
+        if selection_source:
+            provenance["selection_source"] = selection_source[:80]
+        if selector:
+            provenance["selector"] = selector[:600]
+        evidence = state.setdefault("structured_evidence", [])
+        signature = (field_name, value, source)
+        known = {
+            (
+                str((item.get("fields") or [""])[0]),
+                str((item.get("values") or {}).get(field_name) or ""),
+                str(((item.get("provenance") or {}).get(field_name) or {}).get("source") or ""),
+            )
+            for item in evidence
+            if isinstance(item, dict)
+        }
+        if signature not in known:
+            evidence.append(record)
+            del evidence[:-20]
+        BrowserWorkingContextStore._append_required_evidence_slot(
+            state,
+            field_name=field_name,
+            value=value,
+            source=source,
+            generation=generation,
+        )
+        BrowserWorkingContextStore.refresh_field_coverage(state)
+
+    @staticmethod
+    def _append_required_evidence_slot(
+        state: Dict[str, Any],
+        *,
+        field_name: str,
+        value: str,
+        source: str,
+        generation: str,
+    ) -> None:
+        for required in state.get("required_evidence_slots") or []:
+            if not isinstance(required, dict) or str(required.get("field") or "") != field_name:
+                continue
+            key = (
+                str(required.get("entity") or "").lower(),
+                str(required.get("variant") or "").lower(),
+                field_name,
+            )
+            covered = {
+                (
+                    str(slot.get("entity") or "").lower(),
+                    str(slot.get("variant") or "").lower(),
+                    str(slot.get("field") or "").lower(),
+                )
+                for slot in state.setdefault("evidence_slots", [])
+                if isinstance(slot, dict)
+            }
+            if key in covered:
+                continue
+            state["evidence_slots"].append(
+                {
+                    "entity": key[0],
+                    "variant": key[1],
+                    "field": field_name,
+                    "status": "present",
+                    "value": value,
+                    "source": source or "browser_semantic_state",
+                    "generation": generation,
+                    "raw_text": value[:600],
+                }
+            )
+            del state["evidence_slots"][:-20]
+
+    @staticmethod
+    def refresh_field_coverage(state: Dict[str, Any]) -> None:
+        """Derive compatibility field coverage from authoritative evidence."""
+
+        slots = state.get("evidence_slots")
+        if state.get("required_evidence_slots") and isinstance(slots, list):
+            coverage = set()
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                field_name = str(slot.get("field") or "").strip()
+                status = str(slot.get("status") or "present").strip().lower()
+                if field_name and status == "present":
+                    coverage.add(field_name)
+            state["field_coverage"] = sorted(coverage)
+            return
+
+        evidence = state.get("structured_evidence")
+        coverage: set[str] = set()
+        for record in evidence if isinstance(evidence, list) else []:
+            if not isinstance(record, dict):
+                continue
+            statuses = record.get("field_status")
+            statuses = statuses if isinstance(statuses, dict) else {}
+            for field_name in record.get("fields") or []:
+                normalized_field = str(field_name).strip()
+                if normalized_field and statuses.get(field_name, "present") == "present":
+                    coverage.add(normalized_field)
+        state["field_coverage"] = sorted(coverage)
+
+    @staticmethod
+    def _sort_from_changed_results(
+        state: Dict[str, Any],
+        progress: Dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Infer a sort confirmation only from a successful sort click and changed results."""
+
+        target = BrowserWorkingContextStore._successful_click_target(state, progress)
+        if target is None:
+            return None
+        target_text = (
+            " ".join(str(target.get(key) or "") for key in ("element", "name", "label", "text", "value"))
+            .strip()
+            .lower()
+        )
+        for token, label in (
+            ("销量", "销量"),
+            ("sales", "销量"),
+            ("volume", "销量"),
+            ("价格", "价格"),
+            ("price", "价格"),
+            ("最新", "最新"),
+            ("newest", "最新"),
+            ("latest", "最新"),
+            ("综合", "综合"),
+            ("comprehensive", "综合"),
+            ("relevance", "综合"),
+            ("评分", "评分"),
+            ("rating", "评分"),
+        ):
+            if token in target_text:
+                selector = str(target.get("target_id") or target.get("target") or target.get("ref") or "")
+                return label, selector[:600]
+        return None
+
+    @staticmethod
+    def _successful_click_target(
+        state: Dict[str, Any],
+        progress: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        target: Dict[str, Any] | None = None
+        recent_actions = state.get("recent_actions")
+        result_changed = "first_result_text" in set(progress.get("changed_fields") or [])
+        if result_changed and isinstance(recent_actions, list) and recent_actions:
+            action = recent_actions[-1]
+            if isinstance(action, dict) and str(action.get("outcome_status") or "") == "success":
+                try:
+                    candidate = json.loads(str(action.get("target_summary") or "{}"))
+                except (TypeError, ValueError):
+                    candidate = None
+                if isinstance(candidate, dict) and "click" in str(candidate.get("tool") or "").lower():
+                    target = candidate
+        return target
+
+    @staticmethod
+    def _reconcile_observed_action(state: Dict[str, Any], progress: Dict[str, Any]) -> bool:
+        if progress.get("observable_progress") is not True:
+            return False
+        recent_actions = state.get("recent_actions")
+        if not isinstance(recent_actions, list) or not recent_actions:
+            return False
+        action = recent_actions[-1]
+        if not isinstance(action, dict):
+            return False
+        outcome_status = str(action.get("outcome_status") or "")
+        if outcome_status not in {"success", "ambiguous"}:
+            return False
+        if outcome_status == "ambiguous":
+            action["outcome_status"] = "success_after_observation"
+            action["outcome"] = "success_after_observation"
+        action["semantic_delta"] = "progress"
+
+        semantic_state = progress.get("semantic_state")
+        semantic_state = semantic_state if isinstance(semantic_state, dict) else {}
+        changed_fields = {str(field) for field in progress.get("changed_fields") or [] if str(field).strip()}
+        phase = str(action.get("phase") or "")
+        phase_progress = BrowserWorkingContextStore._phase_has_semantic_progress(
+            phase,
+            changed_fields,
+            semantic_state,
+        )
+        if phase_progress:
+            phases = state.get("phases")
+            details = phases.get(phase) if isinstance(phases, dict) else None
+            if isinstance(details, dict):
+                details["status"] = "completed"
+                details["completion_evidence"] = "post-action semantic observation"
+                phase_names = list(phases)
+                try:
+                    remaining = phase_names[phase_names.index(phase) + 1 :]
+                except ValueError:
+                    remaining = []
+                next_phase = phase
+                for name in remaining:
+                    phase_details = phases.get(name)
+                    if isinstance(phase_details, dict) and phase_details.get("status") != "completed":
+                        next_phase = name
+                        break
+                state["current_phase"] = next_phase
+                state["next_action_class"] = next_phase
+        return outcome_status == "ambiguous" or bool(state.get("replan_trial_pending"))
+
+    @staticmethod
+    def _phase_has_semantic_progress(
+        phase: str,
+        changed_fields: set[str],
+        semantic_state: Dict[str, Any],
+    ) -> bool:
+        if phase == "navigation":
+            return "url" in changed_fields and bool(semantic_state.get("url"))
+        if phase == "filtering":
+            if "url" in changed_fields:
+                return True
+            return any(
+                field in changed_fields and semantic_state.get(field) not in (None, "", [], {})
+                for field in ("selected_filters", "first_result_text", "result_count")
+            )
+        if phase == "form":
+            return any(
+                field in changed_fields and semantic_state.get(field) not in (None, "", [], {})
+                for field in ("form_values", "action_feedback", "commerce_state")
+            )
+        return False
 
     @classmethod
     def _apply_replan_observation(
@@ -874,54 +1306,98 @@ class BrowserWorkingContextStore:
     @staticmethod
     def _project_task_state(state: Dict[str, Any]) -> Dict[str, Any]:
         phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
-        compact_phases = {
-            str(name): {
-                "status": details.get("status"),
-                "attempts": int(details.get("attempts") or 0),
-                "budget": int(details.get("budget") or 0),
-                "completion_condition": _bounded_text(details.get("completion_condition"), 240),
-            }
-            for name, details in phases.items()
-            if isinstance(details, dict)
-        }
+        current_phase = str(state.get("current_phase") or "")
+        current_phase_state = phases.get(current_phase) if isinstance(phases.get(current_phase), dict) else {}
         semantic_progress = state.get("semantic_progress")
         compact_semantic: Dict[str, Any] = {}
         if isinstance(semantic_progress, dict):
             semantic_keys = (
-                "progress",
                 "consecutive_no_progress",
                 "state_revisit_count",
-                "aba_loop",
-                "repeated_filter_state",
                 "replan_reason",
             )
             for key in semantic_keys:
                 if key in semantic_progress:
                     compact_semantic[key] = semantic_progress.get(key)
+        required_slots = [
+            BrowserWorkingContextStore._project_evidence_slot(slot, include_value=False)
+            for slot in (state.get("required_evidence_slots") or [])[:16]
+            if isinstance(slot, dict)
+        ]
+        if not required_slots:
+            required_slots = [
+                {"entity": "task", "variant": "default", "field": str(field_name)[:80]}
+                for field_name in (state.get("required_fields") or [])[:16]
+                if str(field_name).strip()
+            ]
+        evidence_slots = [
+            BrowserWorkingContextStore._project_evidence_slot(slot, include_value=True)
+            for slot in (state.get("evidence_slots") or [])[-16:]
+            if isinstance(slot, dict)
+        ]
+        if not evidence_slots:
+            evidence_slots = [
+                {
+                    "entity": "task",
+                    "variant": "default",
+                    "field": str(field_name)[:80],
+                    "status": "present",
+                    "source": "legacy_runtime_state",
+                }
+                for field_name in (state.get("field_coverage") or [])[:16]
+                if str(field_name).strip()
+            ]
+        covered_keys = {BrowserWorkingContextStore._evidence_slot_key(slot) for slot in evidence_slots}
+        missing_slots = [
+            slot for slot in required_slots if BrowserWorkingContextStore._evidence_slot_key(slot) not in covered_keys
+        ]
+        unavailable_slots = [slot for slot in evidence_slots if slot.get("status") in {"missing", "unknown"}]
         return {
             "task_id": state.get("task_id"),
             "goal": _bounded_text(state.get("goal") or state.get("task"), 1_000),
-            "task_type": state.get("task_type"),
             "status": state.get("status", "in_progress"),
-            "current_phase": state.get("current_phase"),
-            "phases": compact_phases,
-            "required_fields": list(state.get("required_fields") or [])[:32],
-            "field_coverage": list(state.get("field_coverage") or [])[:32],
-            "required_evidence_slots": [
-                dict(slot) for slot in (state.get("required_evidence_slots") or [])[:12] if isinstance(slot, dict)
-            ],
-            "evidence_slots": [
-                dict(slot) for slot in (state.get("evidence_slots") or [])[-12:] if isinstance(slot, dict)
-            ],
+            "current_phase": current_phase,
+            "phase_budget": {
+                "attempts": int(current_phase_state.get("attempts") or 0),
+                "limit": int(current_phase_state.get("budget") or 0),
+            },
+            "requirements": {
+                "requested": required_slots,
+                "missing": missing_slots,
+                "unavailable": unavailable_slots,
+                "evidence": evidence_slots,
+            },
             "blockers": list(state.get("blockers") or [])[:8],
             "replan_required": bool(state.get("replan_required")),
             "replan_count": int(state.get("replan_count") or 0),
-            "failed_strategies": list(state.get("failed_strategies") or [])[:8],
-            "next_action_class": state.get("next_action_class"),
             "semantic_progress": compact_semantic,
-            "structured_evidence": BrowserWorkingContextStore.compact_evidence(state.get("structured_evidence")),
             "last_page": dict(state.get("last_page") or {}),
         }
+
+    @staticmethod
+    def _evidence_slot_key(slot: Dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(slot.get("entity") or "").strip().lower(),
+            str(slot.get("variant") or "").strip().lower(),
+            str(slot.get("field") or "").strip().lower(),
+        )
+
+    @staticmethod
+    def _project_evidence_slot(slot: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
+        projected = {
+            "entity": str(slot.get("entity") or "")[:80],
+            "variant": str(slot.get("variant") or "default")[:40],
+            "field": str(slot.get("field") or "")[:80],
+        }
+        if not include_value:
+            return projected
+        projected["status"] = str(slot.get("status") or "present")[:20]
+        if slot.get("value") not in (None, ""):
+            projected["value"] = _bounded_text(slot.get("value"), 300)
+        for key, limit in (("source", 300), ("generation", 40), ("selector", 240), ("raw_text", 300)):
+            if slot.get(key) not in (None, ""):
+                projected[key] = _bounded_text(slot.get(key), limit)
+        return projected
 
     @staticmethod
     def compact_evidence(value: Any) -> list[Dict[str, Any]]:

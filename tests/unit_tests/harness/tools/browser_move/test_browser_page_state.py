@@ -157,6 +157,29 @@ def test_repeated_probe_refreshes_ax_state_without_changing_target_id() -> None:
     assert resolved.ax["states"]["expanded"] is True
 
 
+def test_repeated_probe_refreshes_selection_and_ax_on_the_same_target() -> None:
+    state = BrowserPageState(page_id="page-sort-state")
+    target_id = None
+    for selected, source in [(False, ""), (True, "url-param"), (False, "")]:
+        item = _interactive("#sort-sales", "Sales")
+        item.update(
+            selected=selected,
+            selected_source=source,
+            ax={"role": "tab", "name": "Sales", "states": {"selected": selected}},
+        )
+        state.register_interactives({"elements": [item]})
+        target_id = target_id or item["target_id"]
+        assert item["target_id"] == target_id
+        target = state.resolve_target(generation_id="g0", target_id=target_id)
+        assert target.selected is selected
+        assert target.selected_source == source
+        assert target.ax["states"]["selected"] is selected
+        exported = state.export()["interactives"][0]
+        assert exported.get("selected", False) is selected
+        assert exported.get("selected_source", "") == source
+        assert exported["ax"]["states"]["selected"] is selected
+
+
 def test_cards_add_primary_link_and_field_coverage_to_page_state() -> None:
     state = BrowserPageState(page_id="page-results", generation=4)
     payload = {
@@ -192,6 +215,7 @@ def test_cards_add_primary_link_and_field_coverage_to_page_state() -> None:
 
 def test_card_detail_fields_register_generation_scoped_read_only_targets() -> None:
     state = BrowserPageState(page_id="page-detail", generation=2)
+    state.set_requested_fields(["author", "likes"])
     payload = {
         "cards": [
             {
