@@ -47,6 +47,7 @@ from .browser_working_context import (
     latest_browser_user_request,
 )
 from .config import BrowserInstanceConfig, BrowserRunGuardrails
+from .page_content import fingerprint_snapshot
 from .page_state import CARD_EVIDENCE_FIELDS, BrowserPageState, BrowserTarget
 from .probe_semantics import normalize_card_probe_payload
 from .probes import (
@@ -54,7 +55,7 @@ from .probes import (
     build_card_probe_js,
     build_interactive_probe_js,
 )
-from .semantic_state import SemanticStateTracker, price_interval_signature
+from .semantic_state import SemanticStateTracker, build_semantic_state, price_interval_signature
 from .service import MAX_ITERATION_MESSAGE, BrowserService, BrowserTaskProgressState
 from .site_profiles import (
     get_selector_cache,
@@ -443,6 +444,7 @@ class BrowserAgentRuntime:
         self._selector_primary_links = self._page_state.selector_primary_links
         self._last_observed_url = ""
         self._semantic_state_tracker = SemanticStateTracker()
+        self._semantic_snapshot_identity: tuple[str, str] | None = None
         _ACTIVE_BROWSER_RUNTIMES.add(self)
 
     @property
@@ -541,6 +543,7 @@ class BrowserAgentRuntime:
         page_state = self._ensure_page_state()
         page_state.advance()
         self._page_generation = page_state.generation
+        self._semantic_snapshot_identity = None
 
     def _observe_page_url(self, url: Any, *, force_navigation: bool = False) -> None:
         normalized = str(url or "").strip()
@@ -1083,17 +1086,20 @@ class BrowserAgentRuntime:
 
     async def capture_browser_state(self, *, action_group_id: str = "") -> Dict[str, Any]:
         """Capture a fresh, non-cached browser observation for the next model call."""
+        self._semantic_snapshot_identity = None
         await self.ensure_runtime_ready()
 
         dom = ""
         dom_error = None
-        snapshot_captured = False
+        page_content_hash = None
         snapshot_audit: Dict[str, Any] = {}
         try:
             raw_snapshot = await self._call_playwright_tool("browser_snapshot", {})
+            page_content_hash = fingerprint_snapshot(raw_snapshot)
             raw_snapshot = self._unwrap_mcp_text_result(raw_snapshot)
             snapshot_audit = write_browser_agent_audit_artifact("ax_snapshot", raw_snapshot)
-            snapshot_captured = True
+            if page_content_hash is None:
+                dom_error = "browser_snapshot returned no complete accessibility snapshot"
             if isinstance(raw_snapshot, str):
                 dom = raw_snapshot
             elif raw_snapshot is not None:
@@ -1110,14 +1116,13 @@ class BrowserAgentRuntime:
 
         self._observe_page_url(metadata.get("url"))
         self._ensure_page_state().observe(title=metadata.get("title"))
-        if snapshot_captured:
+        if page_content_hash is not None and dom_error is None:
             self._register_snapshot_refs(dom, replace=True)
         page_state = self.export_page_state()
 
         errors = [error for error in (dom_error, metadata_error) if error]
         semantic_state = metadata.get("semantic_state")
-        if not isinstance(semantic_state, dict):
-            semantic_state = {}
+        semantic_state = dict(semantic_state) if isinstance(semantic_state, dict) else {}
         semantic_state.update(
             {
                 "url": metadata.get("url") or "",
@@ -1125,20 +1130,19 @@ class BrowserAgentRuntime:
             }
         )
         semantic_tracker = self._ensure_semantic_state_tracker()
-        if metadata_error:
-            semantic_progress = semantic_tracker.latest
-            semantic_progress.update(
-                {
-                    "progress": "unknown",
-                    "observable_progress": False,
-                    "capture_error": metadata_error,
-                }
+        if errors:
+            semantic_progress = self._unknown_semantic_progress(
+                semantic_state,
+                error="; ".join(errors),
+                action_group_id=action_group_id,
             )
         else:
+            semantic_state["page_content_hash"] = page_content_hash
             semantic_progress = semantic_tracker.observe(
                 semantic_state,
                 action_group_id=action_group_id,
             )
+            self._semantic_snapshot_identity = (self.generation_id, str(page_state.get("url") or ""))
         semantic_state = self._with_semantic_provenance(
             semantic_progress,
             fallback_state=semantic_state,
@@ -1160,76 +1164,46 @@ class BrowserAgentRuntime:
         }
 
     async def capture_reconciliation_browser_state(self, *, action_group_id: str) -> Dict[str, Any]:
-        """Reconcile an ambiguous mutation without capturing a full AX snapshot."""
-
-        await self.ensure_runtime_ready()
-        metadata, metadata_error = await self._capture_browser_metadata()
-        self._observe_page_url(metadata.get("url"))
-        self._ensure_page_state().observe(title=metadata.get("title"))
-        page_state = self.export_page_state()
-        semantic_state = metadata.get("semantic_state")
-        if not isinstance(semantic_state, dict):
-            semantic_state = {}
-        semantic_state.update(
-            {
-                "url": metadata.get("url") or page_state.get("url") or "",
-                "field_coverage": page_state.get("field_coverage") or [],
-            }
-        )
-        tracker = self._ensure_semantic_state_tracker()
-        if metadata_error:
-            semantic_progress = tracker.latest
-            semantic_progress.update(
-                {
-                    "progress": "unknown",
-                    "observable_progress": False,
-                    "capture_error": metadata_error,
-                }
-            )
-        else:
-            semantic_progress = tracker.observe(semantic_state, action_group_id=action_group_id)
-        semantic_state = self._with_semantic_provenance(
-            semantic_progress,
-            fallback_state=semantic_state,
-        )
-        return {
-            "ok": not metadata_error,
-            "error": metadata_error,
-            "url": metadata.get("url") or page_state.get("url") or "",
-            "title": metadata.get("title") or page_state.get("title") or "",
-            "tabs": metadata.get("tabs") or [],
-            "page_position": metadata.get("page_position") or {},
-            "semantic_state": semantic_state,
-            "semantic_progress": semantic_progress,
-            "field_coverage": semantic_state.get("field_coverage") or [],
-            "page_state": page_state,
-            "dom": "",
-            "dom_error": None,
-            "reconciliation_only": True,
-        }
+        """Reconcile an ambiguous mutation using the same complete observation."""
+        state = await self.capture_browser_state(action_group_id=action_group_id)
+        state["reconciliation_only"] = True
+        return state
 
     async def capture_compact_browser_state(self, *, action_group_id: str) -> Dict[str, Any]:
         """Merge completed read-only observations without another browser round trip."""
         page_state = self.export_page_state()
         semantic_tracker = self._ensure_semantic_state_tracker()
         semantic_state = semantic_tracker.current_state
+        identity = (self.generation_id, str(page_state.get("url") or ""))
+        reusable = bool(
+            getattr(self, "_semantic_snapshot_identity", None) == identity and semantic_state.get("page_content_hash")
+        )
+        if not reusable:
+            self._semantic_snapshot_identity = None
+            semantic_state = {}
         semantic_state.update(
             {
                 "url": page_state.get("url") or semantic_state.get("url") or "",
                 "field_coverage": page_state.get("field_coverage") or semantic_state.get("field_coverage") or [],
             }
         )
-        semantic_progress = semantic_tracker.observe(
-            semantic_state,
-            action_group_id=action_group_id,
-        )
+        capture_error = None
+        if reusable:
+            semantic_progress = semantic_tracker.observe(semantic_state, action_group_id=action_group_id)
+        else:
+            capture_error = "A complete browser capture is required before reusing page content"
+            semantic_progress = self._unknown_semantic_progress(
+                semantic_state,
+                error=capture_error,
+                action_group_id=action_group_id,
+            )
         semantic_state = self._with_semantic_provenance(
             semantic_progress,
             fallback_state=semantic_state,
         )
         return {
-            "ok": True,
-            "error": None,
+            "ok": not capture_error,
+            "error": capture_error,
             "url": page_state.get("url") or "",
             "title": page_state.get("title") or "",
             "tabs": [],
@@ -1241,6 +1215,29 @@ class BrowserAgentRuntime:
             "dom": "",
             "dom_error": None,
         }
+
+    def _unknown_semantic_progress(
+        self,
+        state: dict[str, Any],
+        *,
+        error: str,
+        action_group_id: str,
+    ) -> dict[str, Any]:
+        """Report unavailable content without changing the successful observation history."""
+        semantic_state = build_semantic_state(state)
+        semantic_state.pop("page_content_hash", None)
+        progress = self._ensure_semantic_state_tracker().latest
+        progress.update(
+            {
+                "action_group_id": action_group_id,
+                "semantic_state": semantic_state,
+                "progress": "unknown",
+                "observable_progress": False,
+                "changed_fields": [],
+                "capture_error": error,
+            }
+        )
+        return progress
 
     def _with_semantic_provenance(
         self,
@@ -2215,6 +2212,7 @@ class BrowserAgentRuntime:
     def reset_semantic_task(self) -> None:
         """Start semantic loop tracking for a new user task without resetting Chrome."""
         self._ensure_semantic_state_tracker().reset()
+        self._semantic_snapshot_identity = None
 
     def _ensure_semantic_state_tracker(self) -> SemanticStateTracker:
         tracker = getattr(self, "_semantic_state_tracker", None)
