@@ -12,12 +12,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openjiuwen.core.foundation.tool import McpServerConfig, ToolInfo
 from openjiuwen.core.foundation.llm import ToolCall
 from openjiuwen.core.foundation.llm.schema.message import ToolMessage, UserMessage
+from openjiuwen.core.foundation.tool import McpServerConfig, ToolInfo
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.single_agent.ability_manager import AbilityManager
 from openjiuwen.core.single_agent.prompts.builder import SystemPromptBuilder
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    AgentRail,
+    InvokeInputs,
+    ModelCallInputs,
+    ToolCallInputs,
+)
+from openjiuwen.harness.tools.base_tool import ToolOutput
+from openjiuwen.harness.tools.browser_move.playwright_runtime import runtime as runtime_module
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
     CORE_BROWSER_TOOL_NAMES,
     resolve_browser_capabilities,
@@ -25,12 +34,8 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabiliti
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime import runtime as runtime_module
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
 from openjiuwen.harness.tools.browser_move.playwright_runtime.service import MAX_ITERATION_MESSAGE
-from openjiuwen.harness.tools.base_tool import ToolOutput
-from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail
-from openjiuwen.core.single_agent.rail.base import InvokeInputs, ModelCallInputs, ToolCallInputs
 
 
 def _run(coro):
@@ -74,6 +79,166 @@ def _make_bare_runtime() -> BrowserAgentRuntime:
     runtime._selector_primary_links = {}
     runtime._last_observed_url = ""
     return runtime
+
+
+def _make_capture_runtime() -> BrowserAgentRuntime:
+    runtime = _make_bare_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._call_playwright_tool = AsyncMock(return_value='- button "Filters" [ref=e1]')
+    runtime._call_playwright_run_code_unsafe = AsyncMock(
+        return_value={
+            "ok": True,
+            "url": "https://tenders.example/results",
+            "title": "Tenders",
+            "semantic_state": {"result_count": 2, "first_result_text": "Pinned tender"},
+        }
+    )
+    return runtime
+
+
+@pytest.mark.parametrize("capture_method", ["capture_browser_state", "capture_reconciliation_browser_state"])
+def test_complete_capture_detects_later_results_beyond_context_limits(capture_method: str) -> None:
+    runtime = _make_capture_runtime()
+    padding = json.dumps("unchanged page text " * 1000)
+    runtime._call_playwright_tool.side_effect = [
+        f'- main:\n  - article "Pinned tender" [ref=e1]\n  - paragraph: {padding}\n'
+        f'  - article "Tender {index} closes October {index + 1}" [ref=e2]:\n'
+        f'    - link "Details" [ref=e3]:\n      - /url: https://tenders.example/{index}'
+        for index in range(4)
+    ]
+    capture = getattr(runtime, capture_method)
+    first = _run(capture(action_group_id="initial"))
+    assert first["semantic_progress"]["progress"] == "initial"
+
+    for index in range(1, 4):
+        state = _run(capture(action_group_id=f"action-{index}"))
+        progress = state["semantic_progress"]
+        assert state["ok"] is True
+        assert progress["progress"] == "progress"
+        assert progress["changed_fields"] == ["page_content_hash"]
+        assert progress["consecutive_no_progress"] == 0
+        assert progress["replan_required"] is False
+        assert state["dom"] == ""
+
+    assert runtime._call_playwright_tool.await_count == 4
+    assert runtime._call_playwright_run_code_unsafe.await_count == 4
+    if capture_method == "capture_reconciliation_browser_state":
+        assert state["reconciliation_only"] is True
+
+
+def test_compact_capture_reuses_content_and_preserves_upstream_inspection_counting() -> None:
+    runtime = _make_capture_runtime()
+    initial = _run(runtime.capture_browser_state(action_group_id="initial"))
+    content_hash = initial["semantic_state"]["page_content_hash"]
+
+    for index in range(1, 4):
+        state = _run(runtime.capture_compact_browser_state(action_group_id=f"inspect-{index}"))
+        assert state["semantic_state"]["page_content_hash"] == content_hash
+        assert state["semantic_progress"]["consecutive_no_progress"] == index
+        assert state["semantic_progress"]["replan_required"] is (index == 3)
+
+    runtime._call_playwright_tool.assert_awaited_once()
+    runtime._call_playwright_run_code_unsafe.assert_awaited_once()
+    runtime._ensure_page_state().add_field_coverage(["closing_date"])
+    evidence = _run(runtime.capture_compact_browser_state(action_group_id="new-evidence"))
+    assert evidence["semantic_progress"]["progress"] == "progress"
+    assert evidence["semantic_progress"]["changed_fields"] == ["field_coverage"]
+
+
+@pytest.mark.parametrize("failure", ["snapshot_exception", "invalid_snapshot", "error_envelope", "metadata_exception"])
+def test_failed_capture_invalidates_compact_content_without_advancing_history(failure: str) -> None:
+    runtime = _make_capture_runtime()
+    _run(runtime.capture_browser_state(action_group_id="initial"))
+    _run(runtime.capture_compact_browser_state(action_group_id="inspect"))
+    before = runtime.semantic_progress
+    metadata = runtime._call_playwright_run_code_unsafe.return_value
+    if failure == "snapshot_exception":
+        runtime._call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
+    elif failure == "invalid_snapshot":
+        runtime._call_playwright_tool.return_value = "### Error\nBrowser disconnected"
+    elif failure == "error_envelope":
+        runtime._call_playwright_tool.return_value = {
+            "isError": True,
+            "content": [{"type": "text", "text": '- button "Filters" [ref=e1]'}],
+        }
+    else:
+        runtime._call_playwright_run_code_unsafe.side_effect = RuntimeError("metadata timeout")
+
+    failed = _run(runtime.capture_browser_state(action_group_id="failed-action"))
+    compact = _run(runtime.capture_compact_browser_state(action_group_id="inspection-after-failure"))
+
+    for state in (failed, compact):
+        assert state["ok"] is False
+        assert state["semantic_progress"]["progress"] == "unknown"
+        assert state["semantic_progress"]["observable_progress"] is False
+        assert state["semantic_progress"]["changed_fields"] == []
+        assert "page_content_hash" not in state["semantic_state"]
+        assert "page_content_hash" not in state["semantic_progress"]["semantic_state"]
+    assert runtime.semantic_progress == before
+
+    runtime._call_playwright_tool.side_effect = None
+    runtime._call_playwright_tool.return_value = '- button "Filters" [ref=e99]'
+    runtime._call_playwright_run_code_unsafe.side_effect = None
+    runtime._call_playwright_run_code_unsafe.return_value = metadata
+    recovered = _run(runtime.capture_browser_state(action_group_id="successful-capture"))
+    assert recovered["semantic_progress"]["revision"] == before["revision"] + 1
+    assert recovered["semantic_progress"]["progress"] == "no_progress"
+    assert recovered["semantic_progress"]["consecutive_no_progress"] == 2
+    assert _run(runtime.capture_compact_browser_state(action_group_id="fresh-inspection"))["ok"] is True
+
+
+@pytest.mark.parametrize("invalidate", ["generation", "url", "task_reset"])
+def test_compact_capture_rejects_content_from_a_different_page_or_task(invalidate: str) -> None:
+    runtime = _make_capture_runtime()
+    _run(runtime.capture_browser_state(action_group_id="initial"))
+    if invalidate == "generation":
+        runtime._observe_page_url("https://tenders.example/results", force_navigation=True)
+    elif invalidate == "url":
+        runtime._ensure_page_state().observe(url="https://tenders.example/new-page")
+    else:
+        runtime.reset_semantic_task()
+    before = runtime.semantic_progress
+
+    compact = _run(runtime.capture_compact_browser_state(action_group_id="inspection"))
+
+    assert compact["semantic_progress"]["progress"] == "unknown"
+    assert "page_content_hash" not in compact["semantic_state"]
+    assert runtime.semantic_progress == before
+    runtime._ensure_page_state().observe(url="https://tenders.example/results")
+    repeated = _run(runtime.capture_compact_browser_state(action_group_id="repeated-inspection"))
+    assert repeated["semantic_progress"]["progress"] == "unknown"
+    assert runtime.semantic_progress == before
+
+
+def test_compact_capture_without_complete_baseline_does_not_start_history() -> None:
+    runtime = _make_bare_runtime()
+    runtime._ensure_page_state().observe(url="https://tenders.example/results")
+
+    compact = _run(runtime.capture_compact_browser_state(action_group_id="inspection"))
+
+    assert compact["semantic_progress"]["progress"] == "unknown"
+    assert runtime.semantic_progress == {}
+
+
+def test_failed_navigation_capture_does_not_relabel_previous_page_content() -> None:
+    runtime = _make_capture_runtime()
+    initial = _run(runtime.capture_browser_state(action_group_id="initial"))
+    runtime._call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
+    runtime._call_playwright_run_code_unsafe.return_value = {
+        "ok": True,
+        "url": "https://tenders.example/other-page",
+    }
+
+    failed = _run(runtime.capture_browser_state(action_group_id="navigation"))
+
+    assert failed["semantic_state"]["url"] == "https://tenders.example/other-page"
+    assert failed["semantic_state"]["generation_id"] != initial["semantic_state"]["generation_id"]
+    assert "page_content_hash" not in failed["semantic_state"]
+    assert "first_result_text" not in failed["semantic_state"]
+    assert (
+        runtime.semantic_progress["semantic_state"]["page_content_hash"]
+        == initial["semantic_state"]["page_content_hash"]
+    )
 
 
 def test_rail_is_agent_rail_subclass() -> None:
