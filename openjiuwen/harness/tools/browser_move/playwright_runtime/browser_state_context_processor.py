@@ -20,6 +20,7 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
 
 from .browser_logging import browser_agent_log_warning
 from .browser_working_context import BrowserWorkingContextStore
+from .tool_categories import is_browser_read_tool
 
 _BROWSER_STATE_MESSAGE_NAME = "current_browser_state"
 _BROWSER_STATE_METADATA_KEY = "browser_state_context"
@@ -80,14 +81,6 @@ _BROWSER_STATE_REFRESH_TOOL_NAMES = frozenset(
         "browser_set_storage_state",
     }
 )
-_BROWSER_STATE_OBSERVATION_TOOL_NAMES = frozenset(
-    {
-        "browser_find",
-        "browser_probe_cards",
-        "browser_probe_interactives",
-        "browser_snapshot",
-    }
-)
 
 
 class BrowserStateContextProcessorConfig(BaseModel):
@@ -135,7 +128,9 @@ class BrowserStateContextProcessor(ContextProcessor):
         del kwargs
         source_messages = context.get_messages() if context is not None else context_window.context_messages
         action_group_id, refresh_tool_call_ids, observation_only = self._completed_state_action_group(source_messages)
-        reconciliation_only = self._requires_reconciliation(source_messages, refresh_tool_call_ids)
+        reconciliation_only = not observation_only and self._requires_reconciliation(
+            source_messages, refresh_tool_call_ids - self._seen_refresh_tool_call_ids
+        )
         should_refresh = self._cached_state is None or bool(
             action_group_id and action_group_id not in self._seen_action_group_ids
         )
@@ -343,15 +338,14 @@ class BrowserStateContextProcessor(ContextProcessor):
 
     @staticmethod
     def _is_observation_tool_name(tool_name: str) -> bool:
-        return any(
-            tool_name == expected or tool_name.endswith(f".{expected}") or tool_name.endswith(f"_{expected}")
-            for expected in _BROWSER_STATE_OBSERVATION_TOOL_NAMES
-        )
+        return is_browser_read_tool(tool_name)
 
-    async def _capture_state(self, *, action_group_id: str) -> Dict[str, Any]:
+    async def _capture_state(self, *, action_group_id: str, observation_only: bool = False) -> Dict[str, Any]:
         try:
             capture = self.config.provider.capture_browser_state
-            if action_group_id == "initial":
+            if observation_only:
+                state = await capture(action_group_id=action_group_id, observation_only=True)
+            elif action_group_id == "initial":
                 state = await capture()
             else:
                 try:
@@ -390,7 +384,7 @@ class BrowserStateContextProcessor(ContextProcessor):
     async def _capture_compact_state(self, *, action_group_id: str) -> Dict[str, Any]:
         capture = getattr(self.config.provider, "capture_compact_browser_state", None)
         if not callable(capture):
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, observation_only=True)
         try:
             state = await capture(action_group_id=action_group_id)
         except Exception as exc:
@@ -398,9 +392,9 @@ class BrowserStateContextProcessor(ContextProcessor):
                 "[BrowserStateContextProcessor] compact browser state merge failed: %s",
                 exc,
             )
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, observation_only=True)
         if not isinstance(state, dict):
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, observation_only=True)
         if self._cached_state:
             if not state.get("tabs"):
                 state["tabs"] = self._cached_state.get("tabs") or []
@@ -459,8 +453,8 @@ class BrowserStateContextProcessor(ContextProcessor):
             "This observation was captured initially or after the latest detected browser mutation and "
             "replaces any previous browser state. It is reused until another state-invalidating browser "
             "tool completes; element references may become stale if the page changes independently. "
-            "Task progress is provided in the browser working context. Raw AX/Card data is "
-            "available only in the browser audit trace.\n"
+            "Task progress is provided in the browser working context. Full snapshot/find "
+            "observations are available in recent tool results.\n"
             f"{json.dumps(state_header, ensure_ascii=False, separators=(',', ':'))}\n"
             "</browser_state>"
         )

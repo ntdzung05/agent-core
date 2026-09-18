@@ -1041,6 +1041,60 @@ def test_processor_projects_runtime_task_state_before_current_page_state() -> No
     assert "script_exploration" in prompt
 
 
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("progress_name", ["inspection", "unknown"])
+def test_read_observation_preserves_active_interaction_replan(pending: bool, progress_name: str) -> None:
+    session = _FakeSession()
+    preserved = {
+        "status": "replan_trial" if pending else "replan_required",
+        "replan_required": True,
+        "replan_trial_pending": pending,
+        "replan_count": 1,
+        "trial_strategy": "new-click" if pending else "",
+        "blocked_strategy": "failed-click",
+        "failed_strategies": ["failed-click"],
+        "next_action_class": "materially_different_strategy",
+    }
+    state = {"task_id": "read-replan", **preserved}
+    session.update_state({BROWSER_TASK_STATE_KEY: state})
+    progress = {
+        "revision": 1,
+        "progress": progress_name,
+        "observation_only": True,
+        "observable_progress": False,
+        "replan_required": True,
+        "consecutive_no_progress": 3,
+        "semantic_state": {"url": "https://example.test/form"},
+    }
+
+    assert BrowserWorkingContextStore.sync_semantic_progress(session, progress) is False
+
+    updated = session.get_state(BROWSER_TASK_STATE_KEY)
+    assert {key: updated[key] for key in preserved} == preserved
+    assert updated["semantic_progress"]["observation_only"] is True
+    assert BrowserWorkingContextStore._project_task_state(updated)["semantic_progress"]["observation_only"] is True
+
+
+def test_new_evidence_from_read_observation_can_recover_pending_trial() -> None:
+    session = _FakeSession()
+    session.update_state({BROWSER_TASK_STATE_KEY: {
+        "task_id": "read-evidence", "status": "replan_trial", "replan_required": True,
+        "replan_trial_pending": True, "trial_strategy": "click-search", "replan_count": 1,
+    }})
+    progress = {
+        "revision": 1, "progress": "progress", "observation_only": True,
+        "observable_progress": True, "changed_fields": ["field_coverage"],
+        "semantic_state": {"url": "https://example.test/results", "field_coverage": ["title"]},
+    }
+
+    assert BrowserWorkingContextStore.sync_semantic_progress(session, progress) is True
+
+    updated = session.get_state(BROWSER_TASK_STATE_KEY)
+    assert updated["replan_required"] is False
+    assert updated["replan_trial_pending"] is False
+    assert updated["replan_count"] == 1
+
+
 def test_semantic_observation_closes_sort_evidence_before_replan_gate() -> None:
     session = _FakeSession()
     session.update_state(

@@ -66,6 +66,7 @@ from .site_profiles import (
     site_profiles_for_url,
 )
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
+from .tool_categories import is_browser_read_tool
 
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
@@ -1091,7 +1092,9 @@ class BrowserAgentRuntime:
         self._controller.bind_code_executor(_direct_code_executor)
         self._controller.register_builtin_actions()
 
-    async def capture_browser_state(self, *, action_group_id: str = "") -> Dict[str, Any]:
+    async def capture_browser_state(
+        self, *, action_group_id: str = "", observation_only: bool = False,
+    ) -> Dict[str, Any]:
         """Capture a fresh, non-cached browser observation for the next model call."""
         self._semantic_snapshot_identity = None
         await self.ensure_runtime_ready()
@@ -1142,12 +1145,14 @@ class BrowserAgentRuntime:
                 semantic_state,
                 error="; ".join(errors),
                 action_group_id=action_group_id,
+                observation_only=observation_only,
             )
         else:
             semantic_state["page_content_hash"] = page_content_hash
             semantic_progress = semantic_tracker.observe(
                 semantic_state,
                 action_group_id=action_group_id,
+                observation_only=observation_only,
             )
             self._semantic_snapshot_identity = (self.generation_id, str(page_state.get("url") or ""))
         semantic_state = self._with_semantic_provenance(
@@ -1196,13 +1201,16 @@ class BrowserAgentRuntime:
         )
         capture_error = None
         if reusable:
-            semantic_progress = semantic_tracker.observe(semantic_state, action_group_id=action_group_id)
+            semantic_progress = semantic_tracker.observe(
+                semantic_state, action_group_id=action_group_id, observation_only=True
+            )
         else:
             capture_error = "A complete browser capture is required before reusing page content"
             semantic_progress = self._unknown_semantic_progress(
                 semantic_state,
                 error=capture_error,
                 action_group_id=action_group_id,
+                observation_only=True,
             )
         semantic_state = self._with_semantic_provenance(
             semantic_progress,
@@ -1229,6 +1237,7 @@ class BrowserAgentRuntime:
         *,
         error: str,
         action_group_id: str,
+        observation_only: bool = False,
     ) -> dict[str, Any]:
         """Report unavailable content without changing the successful observation history."""
         semantic_state = build_semantic_state(state)
@@ -1240,6 +1249,7 @@ class BrowserAgentRuntime:
                 "semantic_state": semantic_state,
                 "progress": "unknown",
                 "observable_progress": False,
+                "observation_only": observation_only,
                 "changed_fields": [],
                 "capture_error": error,
             }
@@ -2870,7 +2880,12 @@ class BrowserRuntimeRail(AgentRail):
             replan_group_admitted=bool(group.get("read_only") and group.get("trial_admitted")),
         )
         state = session.get_state(_BROWSER_PHASE_STATE_KEY) if session is not None else None
-        if isinstance(state, dict) and state.get("replan_trial_pending") and group.get("read_only"):
+        if (
+            isinstance(state, dict)
+            and state.get("replan_trial_pending")
+            and group.get("read_only")
+            and not is_browser_read_tool(tool_name)
+        ):
             group["trial_admitted"] = True
         extra = getattr(ctx, "extra", None)
         if isinstance(extra, dict):
@@ -3191,7 +3206,14 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _compact_large_observation_message(inputs: Any, tool_name: str, tool_result: Any) -> None:
-        """Bound one model-visible raw observation after runtime evidence extraction."""
+        """Bound observations after evidence extraction, except snapshot/find."""
+
+        # Temporary bypass: keep complete AX observations available for browser recovery.
+        if _contains_any_token(
+            str(tool_name or "").strip().lower(),
+            ("browser_snapshot", "browser_find"),
+        ):
+            return
 
         tool_msg = getattr(inputs, "tool_msg", None)
         content = getattr(tool_msg, "content", None)
@@ -3338,14 +3360,7 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _tool_may_change_browser_state(tool_name: str) -> bool:
-        normalized = str(tool_name or "").strip().lower()
-        observation_tokens = (
-            "browser_probe_cards",
-            "browser_probe_interactives",
-            "browser_snapshot",
-            "browser_find",
-        )
-        return not _contains_any_token(normalized, observation_tokens)
+        return not is_browser_read_tool(tool_name)
 
     def _canonicalize_tool_name(self, tool_name: str) -> str:
         canonical = canonicalize_playwright_tool_name(tool_name)
@@ -3448,17 +3463,7 @@ class BrowserRuntimeRail(AgentRail):
         if tool_msg is None or not isinstance(content, str):
             return
         if _contains_any_token(normalized_name, ("browser_snapshot", "browser_find")):
-            compact_observation = {
-                "ok": True,
-                "observation": "compact_page_state",
-                "page_state": page_state,
-                "audit": write_browser_agent_audit_artifact("direct_ax_observation", tool_result),
-            }
-            tool_msg.content = json.dumps(
-                compact_observation,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            # Temporary bypass: retain the original tool text after registering its targets.
             return
         marker = (
             f"\n<{_BROWSER_PAGE_STATE_TAG}>"
@@ -4774,9 +4779,10 @@ class BrowserRuntimeRail(AgentRail):
         details["last_signature"] = signature
         details["last_semantic_signature"] = signature
         state["current_phase"] = phase
-        state["last_action_class"] = action_class
-        state["last_strategy_fingerprint"] = strategy_fingerprint
-        state["next_action_class"] = ""
+        if not is_browser_read_tool(tool_name):
+            state["last_action_class"] = action_class
+            state["last_strategy_fingerprint"] = strategy_fingerprint
+            state["next_action_class"] = ""
         session.update_state({_BROWSER_PHASE_STATE_KEY: state})
         return action_class
 
@@ -4896,6 +4902,8 @@ class BrowserRuntimeRail(AgentRail):
         strategy_fingerprint: str = "",
     ) -> None:
         cls._reject_terminal_state(state)
+        if is_browser_read_tool(tool_name):
+            return
         if not state.get("replan_required"):
             return
         if cls._is_replan_exempt_tool(tool_name):
@@ -5071,7 +5079,9 @@ class BrowserRuntimeRail(AgentRail):
                 args,
                 result,
             )
-            cls._record_failed_phase_result(state, details, tool_result)
+            cls._record_failed_phase_result(
+                state, details, tool_result, observation_only=is_browser_read_tool(tool_name)
+            )
             missing_fields = cls._missing_completion_requirements(state) if phase == "extraction" else []
             if completion_evidence and not missing_fields:
                 cls._complete_phase(state, phases, phase, details, completion_evidence)
@@ -5200,13 +5210,19 @@ class BrowserRuntimeRail(AgentRail):
         )
 
     @staticmethod
-    def _record_failed_phase_result(state: Dict[str, Any], details: Dict[str, Any], tool_result: Any) -> None:
+    def _record_failed_phase_result(
+        state: Dict[str, Any],
+        details: Dict[str, Any],
+        tool_result: Any,
+        *,
+        observation_only: bool = False,
+    ) -> None:
         if str(state.get("status") or "").strip().lower() in _BROWSER_TERMINAL_STATUSES:
             return
         details["status"] = "pending"
         if isinstance(tool_result, dict):
             details["last_error"] = str(tool_result.get("error") or "")[:300]
-        if not state.get("replan_trial_pending"):
+        if observation_only or not state.get("replan_trial_pending"):
             return
         trial_strategy = str(state.get("trial_strategy") or "")
         state["replan_trial_pending"] = False

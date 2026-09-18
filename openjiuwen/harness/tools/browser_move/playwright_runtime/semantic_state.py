@@ -317,6 +317,7 @@ class SemanticStateTracker:
         raw_state: Mapping[str, Any],
         *,
         action_group_id: str = "",
+        observation_only: bool = False,
     ) -> Dict[str, Any]:
         """Record one model action group and return its progress classification."""
         normalized_group_id = str(action_group_id or "").strip()
@@ -346,6 +347,14 @@ class SemanticStateTracker:
         # Reused filters can reveal new results; complete content takes precedence.
         if not self._history:
             progress = "initial"
+        elif observation_only and (
+            repeated_state
+            or state_revisit
+            or (repeated_filter_state and not semantic_state.get("page_content_hash"))
+        ):
+            # Inspecting an unchanged or previously seen page is not a failed
+            # interaction, and must neither spend nor clear its failure budget.
+            progress = "inspection"
         elif repeated_state:
             progress = "no_progress"
             self._consecutive_no_progress += 1
@@ -358,8 +367,10 @@ class SemanticStateTracker:
             self._consecutive_no_progress = 0
             self._state_revisit_count = 0
 
-        self._history.append(state_digest)
-        self._filter_history.append(filter_digest)
+        # Repeated reads must not evict the states used to detect action loops.
+        if progress != "inspection":
+            self._history.append(state_digest)
+            self._filter_history.append(filter_digest)
         self._last_state = semantic_state
         self._revision += 1
 
@@ -376,6 +387,7 @@ class SemanticStateTracker:
         self._latest = {
             "revision": self._revision,
             "action_group_id": normalized_group_id,
+            "observation_only": observation_only,
             "semantic_state": semantic_state,
             "changed_fields": changed_fields,
             "progress": progress,

@@ -597,6 +597,7 @@ class BrowserWorkingContextStore:
         semantic_keys = (
             "progress",
             "observable_progress",
+            "observation_only",
             "consecutive_no_progress",
             "state_revisit_count",
             "aba_loop",
@@ -954,6 +955,9 @@ class BrowserWorkingContextStore:
             return
         if recovered:
             cls.mark_replan_recovered(state)
+        elif progress.get("observation_only"):
+            # An unchanged read does not evaluate the pending interaction strategy.
+            return
         elif state.get("replan_trial_pending"):
             trial_strategy = str(state.get("trial_strategy") or "")
             cls.record_failed_strategy(state, trial_strategy)
@@ -1004,6 +1008,7 @@ class BrowserWorkingContextStore:
         compact_semantic: Dict[str, Any] = {}
         if isinstance(semantic_progress, dict):
             semantic_keys = (
+                "observation_only",
                 "consecutive_no_progress",
                 "state_revisit_count",
                 "replan_reason",
