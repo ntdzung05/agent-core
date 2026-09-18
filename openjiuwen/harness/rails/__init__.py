@@ -9,7 +9,10 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.rails.evolution import (
     configure_skill_evolution,
     configure_skill_evolution_runtime,
+    configure_ttse_evolution,
+    configure_ttse_evolution_runtime,
     unconfigure_skill_evolution,
+    unconfigure_ttse_evolution,
     ContextEvolveRail,
     ContextEvolutionRail,
     EvolutionInterruptRail,
@@ -21,10 +24,10 @@ from openjiuwen.harness.rails.evolution import (
     SummarizeTrajectoriesInput,
     CapabilityIdentity,
     CapabilitySnapshotProvider,
+    GraphSnapshotProvider,
+    SymphonyEvolutionSubmitCallback,
     SymphonyGraphEvolutionInput,
     SymphonyGraphEvolutionRail,
-    SymphonyGraphEvolutionSubmission,
-    SymphonyGraphObservationSink,
     TeamSymphonyGraphEvolutionRail,
     TeamSkillEvolutionRail,
     TeamContextEvolutionRail,
@@ -85,6 +88,7 @@ __all__ = [
     "CodingMemoryRail",
     "CapabilityIdentity",
     "CapabilitySnapshotProvider",
+    "GraphSnapshotProvider",
     "ConfirmInterruptRail",
     "ContextEvolutionRail",
     "ContextEvolveRail",
@@ -118,8 +122,7 @@ __all__ = [
     "SummarizeTrajectoriesInput",
     "SymphonyGraphEvolutionInput",
     "SymphonyGraphEvolutionRail",
-    "SymphonyGraphEvolutionSubmission",
-    "SymphonyGraphObservationSink",
+    "SymphonyEvolutionSubmitCallback",
     "SysOperationRail",
     "TeamContextEvolutionRail",
     "TeamInsightBuffer",
@@ -132,8 +135,26 @@ __all__ = [
     "TeamSkillRail",
     "configure_skill_evolution",
     "configure_skill_evolution_runtime",
+    "configure_ttse_evolution",
+    "configure_ttse_evolution_runtime",
     "unconfigure_skill_evolution",
+    "unconfigure_ttse_evolution",
     "TrajectoryRail",
+    "TTSERail",
     "VerificationContractRail",
     "VerificationRail",
 ]
+
+
+def __getattr__(name: str):
+    """Load TTSERail only when the TTSE export is requested."""
+    if name != "TTSERail":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from openjiuwen.harness.rails.evolution import TTSERail
+
+    globals()["TTSERail"] = TTSERail
+    return TTSERail
+
+
+def __dir__():
+    return sorted({*globals().keys(), "TTSERail"})
