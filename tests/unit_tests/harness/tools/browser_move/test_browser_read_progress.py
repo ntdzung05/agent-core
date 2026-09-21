@@ -135,7 +135,7 @@ async def test_reads_preserve_interaction_progress_and_replan_budget(browser_flo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("compact_error", [True, False], ids=["exception", "non_object"])
-async def test_read_fallback_capture_preserves_read_category(browser_flow, compact_error: bool) -> None:
+async def test_read_fallback_capture_preserves_observation_category(browser_flow, compact_error: bool) -> None:
     runtime, session, context, processor = browser_flow
     await _render(context, processor)
     runtime.capture_compact_browser_state.return_value = None

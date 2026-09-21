@@ -66,7 +66,7 @@ from .site_profiles import (
     site_profiles_for_url,
 )
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
-from .tool_categories import is_browser_read_tool
+from .tool_categories import is_browser_observation_tool
 
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
@@ -2884,7 +2884,7 @@ class BrowserRuntimeRail(AgentRail):
             isinstance(state, dict)
             and state.get("replan_trial_pending")
             and group.get("read_only")
-            and not is_browser_read_tool(tool_name)
+            and not is_browser_observation_tool(tool_name)
         ):
             group["trial_admitted"] = True
         extra = getattr(ctx, "extra", None)
@@ -3360,7 +3360,7 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _tool_may_change_browser_state(tool_name: str) -> bool:
-        return not is_browser_read_tool(tool_name)
+        return not is_browser_observation_tool(tool_name)
 
     def _canonicalize_tool_name(self, tool_name: str) -> str:
         canonical = canonicalize_playwright_tool_name(tool_name)
@@ -4779,7 +4779,7 @@ class BrowserRuntimeRail(AgentRail):
         details["last_signature"] = signature
         details["last_semantic_signature"] = signature
         state["current_phase"] = phase
-        if not is_browser_read_tool(tool_name):
+        if not is_browser_observation_tool(tool_name):
             state["last_action_class"] = action_class
             state["last_strategy_fingerprint"] = strategy_fingerprint
             state["next_action_class"] = ""
@@ -4902,7 +4902,7 @@ class BrowserRuntimeRail(AgentRail):
         strategy_fingerprint: str = "",
     ) -> None:
         cls._reject_terminal_state(state)
-        if is_browser_read_tool(tool_name):
+        if is_browser_observation_tool(tool_name):
             return
         if not state.get("replan_required"):
             return
@@ -5080,7 +5080,7 @@ class BrowserRuntimeRail(AgentRail):
                 result,
             )
             cls._record_failed_phase_result(
-                state, details, tool_result, observation_only=is_browser_read_tool(tool_name)
+                state, details, tool_result, observation_only=is_browser_observation_tool(tool_name)
             )
             missing_fields = cls._missing_completion_requirements(state) if phase == "extraction" else []
             if completion_evidence and not missing_fields:

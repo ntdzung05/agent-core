@@ -20,7 +20,7 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
 
 from .browser_logging import browser_agent_log_warning
 from .browser_working_context import BrowserWorkingContextStore
-from .tool_categories import is_browser_read_tool
+from .tool_categories import is_browser_observation_tool
 
 _BROWSER_STATE_MESSAGE_NAME = "current_browser_state"
 _BROWSER_STATE_METADATA_KEY = "browser_state_context"
@@ -338,7 +338,7 @@ class BrowserStateContextProcessor(ContextProcessor):
 
     @staticmethod
     def _is_observation_tool_name(tool_name: str) -> bool:
-        return is_browser_read_tool(tool_name)
+        return is_browser_observation_tool(tool_name)
 
     async def _capture_state(self, *, action_group_id: str, observation_only: bool = False) -> Dict[str, Any]:
         try:

@@ -160,14 +160,14 @@ def test_completed_parallel_calls_form_one_refresh_action_group() -> None:
     "browser_find", "browser_probe_cards", "browser_probe_interactives", "browser_snapshot",
 ])
 @pytest.mark.parametrize("prefix", ["", "playwright-official.", "mcp_playwright-official_"])
-def test_read_category_recognizes_each_supported_tool_and_mcp_name(tool_name: str, prefix: str) -> None:
+def test_observation_category_recognizes_each_supported_tool_and_mcp_name(tool_name: str, prefix: str) -> None:
     assert BrowserStateContextProcessor._is_observation_tool_name(prefix + tool_name)
 
 
 @pytest.mark.parametrize("tool_name", [
     "browser_probe_other", "browser_snapshot_extra", "browser_click", "browser_batch_interact", "browser_run_code",
 ])
-def test_read_category_does_not_infer_safety_from_partial_names(tool_name: str) -> None:
+def test_observation_category_does_not_infer_safety_from_partial_names(tool_name: str) -> None:
     assert not BrowserStateContextProcessor._is_observation_tool_name(tool_name)
 
 
