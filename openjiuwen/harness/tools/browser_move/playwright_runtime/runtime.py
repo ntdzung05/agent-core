@@ -1225,7 +1225,7 @@ class BrowserAgentRuntime:
             "page_position": {},
             "semantic_state": semantic_state,
             "semantic_progress": semantic_progress,
-            "field_coverage": semantic_state["field_coverage"],
+            "field_coverage": semantic_state.get("field_coverage", []),
             "page_state": page_state,
             "dom": "",
             "dom_error": None,
@@ -2880,12 +2880,8 @@ class BrowserRuntimeRail(AgentRail):
             replan_group_admitted=bool(group.get("read_only") and group.get("trial_admitted")),
         )
         state = session.get_state(_BROWSER_PHASE_STATE_KEY) if session is not None else None
-        if (
-            isinstance(state, dict)
-            and state.get("replan_trial_pending")
-            and group.get("read_only")
-            and not is_browser_observation_tool(tool_name)
-        ):
+        trial_pending = isinstance(state, dict) and state.get("replan_trial_pending")
+        if trial_pending and group.get("read_only") and not is_browser_observation_tool(tool_name):
             group["trial_admitted"] = True
         extra = getattr(ctx, "extra", None)
         if isinstance(extra, dict):

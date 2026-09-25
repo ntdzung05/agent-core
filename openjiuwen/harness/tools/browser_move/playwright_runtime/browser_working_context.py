@@ -883,11 +883,9 @@ class BrowserWorkingContextStore:
         semantic_state = semantic_state if isinstance(semantic_state, dict) else {}
         changed_fields = {str(field) for field in progress.get("changed_fields") or [] if str(field).strip()}
         # A baseline or content-only change cannot verify the action's intended effect.
-        if (
-            outcome_status not in {"success", "ambiguous"}
-            or (progress.get("progress") == "initial" and semantic_state.get("page_content_hash"))
-            or (outcome_status == "ambiguous" and changed_fields == {"page_content_hash"})
-        ):
+        initial_content_observation = progress.get("progress") == "initial" and semantic_state.get("page_content_hash")
+        ambiguous_content_change = outcome_status == "ambiguous" and changed_fields == {"page_content_hash"}
+        if outcome_status not in {"success", "ambiguous"} or initial_content_observation or ambiguous_content_change:
             return False
         if outcome_status == "ambiguous":
             action["outcome_status"] = "success_after_observation"

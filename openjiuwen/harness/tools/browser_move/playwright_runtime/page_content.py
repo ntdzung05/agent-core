@@ -83,7 +83,8 @@ def _unwrap_snapshot(raw: Any) -> Any:
             if id(raw) in seen:
                 raise ValueError("Recursive snapshot envelope")
             seen[id(raw)] = raw
-            if raw.get("isError") is True or raw.get("ok") is False or raw.get("success") is False or raw.get("error"):
+            capture_failed = raw.get("isError") is True or raw.get("ok") is False or raw.get("success") is False
+            if capture_failed or raw.get("error"):
                 raise ValueError("Snapshot capture failed")
             if raw.get("role"):
                 return raw
@@ -198,5 +199,5 @@ def fingerprint_snapshot(raw: Any) -> str | None:
             normalized = ["json", _json_content(roots, set())] if roots else ["children", []]
         serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    except (ValueError, TypeError, RecursionError, UnicodeError, yaml.YAMLError):
+    except (ValueError, TypeError, RecursionError, yaml.YAMLError):
         return None

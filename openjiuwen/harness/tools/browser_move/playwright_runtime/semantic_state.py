@@ -345,20 +345,17 @@ class SemanticStateTracker:
         )
 
         # Reused filters can reveal new results; complete content takes precedence.
+        revisit_detected = state_revisit or (repeated_filter_state and not semantic_state.get("page_content_hash"))
         if not self._history:
             progress = "initial"
-        elif observation_only and (
-            repeated_state
-            or state_revisit
-            or (repeated_filter_state and not semantic_state.get("page_content_hash"))
-        ):
+        elif observation_only and (repeated_state or revisit_detected):
             # Inspecting an unchanged or previously seen page is not a failed
             # interaction, and must neither spend nor clear its failure budget.
             progress = "inspection"
         elif repeated_state:
             progress = "no_progress"
             self._consecutive_no_progress += 1
-        elif state_revisit or (repeated_filter_state and not semantic_state.get("page_content_hash")):
+        elif revisit_detected:
             progress = "state_revisit"
             self._consecutive_no_progress += 1
             self._state_revisit_count += 1
