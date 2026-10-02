@@ -41,6 +41,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_co
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessorConfig,
 )
+from openjiuwen.harness.tools.browser_move.playwright_runtime.page_content import fingerprint_snapshot
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
 from openjiuwen.harness.tools.browser_move.playwright_runtime.service import MAX_ITERATION_MESSAGE
 
@@ -104,15 +105,27 @@ def _make_capture_runtime() -> BrowserAgentRuntime:
 
 
 @pytest.mark.parametrize("capture_method", ["capture_browser_state", "capture_reconciliation_browser_state"])
-def test_complete_capture_detects_later_results_beyond_context_limits(capture_method: str) -> None:
+@pytest.mark.parametrize("wrapped_result", [False, True], ids=["text", "nested-json-mcp"])
+def test_complete_capture_detects_later_results_beyond_context_limits(
+    capture_method: str,
+    wrapped_result: bool,
+) -> None:
     runtime = _make_capture_runtime()
     padding = json.dumps("unchanged page text " * 1000)
-    runtime._call_playwright_tool.side_effect = [
+    snapshots = [
         f'- main:\n  - article "Pinned tender" [ref=e1]\n  - paragraph: {padding}\n'
-        f'  - article "Tender {index} closes October {index + 1}" [ref=e2]:\n'
-        f'    - link "Details" [ref=e3]:\n      - /url: https://tenders.example/{index}'
+        '  - article "Tender" [ref=e2]:\n'
+        f'    - paragraph: Tender {index} closes October {index + 1} {"x" * 6100}\n'
+        '    - link "Details" [ref=e3]:\n      - /url: https://tenders.example/details'
         for index in range(4)
     ]
+    runtime._call_playwright_tool.side_effect = [
+        json.dumps({"result": {"content": [{"type": "text", "text": snapshot}]}})
+        if wrapped_result
+        else snapshot
+        for snapshot in snapshots
+    ]
+    runtime.persist_observation = AsyncMock(return_value="a" * 32)
     capture = getattr(runtime, capture_method)
     first = _run(capture(action_group_id="initial"))
     assert first["semantic_progress"]["progress"] == "initial"
@@ -125,12 +138,50 @@ def test_complete_capture_detects_later_results_beyond_context_limits(capture_me
         assert progress["changed_fields"] == ["page_content_hash"]
         assert progress["consecutive_no_progress"] == 0
         assert progress["replan_required"] is False
-        assert state["dom"] == ""
+        assert state["semantic_state"]["page_content_hash"] == fingerprint_snapshot(snapshots[index])
+        assert "Details" in state["dom"]
+        assert f"Tender {index} closes October" not in state["dom"]
+        runtime.validate_reference_values(("e3",))
+        target = runtime._ensure_page_state().resolve_target(generation_id=runtime.generation_id, ref="e3")
+        assert target.name == "Details"
+        runtime.persist_observation.assert_any_await(snapshots[index], "browser_snapshot")
 
     assert runtime._call_playwright_tool.await_count == 4
     assert runtime._call_playwright_run_code_unsafe.await_count == 4
     if capture_method == "capture_reconciliation_browser_state":
         assert state["reconciliation_only"] is True
+
+
+@pytest.mark.parametrize("capture_method", ["capture_browser_state", "capture_reconciliation_browser_state"])
+@pytest.mark.parametrize("filter_changed", [False, True])
+def test_capture_invalidates_only_changed_listing_targets(capture_method: str, filter_changed: bool) -> None:
+    runtime = _make_capture_runtime()
+    metadata = runtime._call_playwright_run_code_unsafe.return_value
+    metadata["semantic_state"]["selected_filters"] = [{"key": "sort", "value": "oldest"}]
+    _run(runtime.capture_browser_state(action_group_id="initial"))
+    page_state = runtime._ensure_page_state()
+    cards = page_state.register_cards(
+        {"cards": [{"selector_hint": "#old-card", "selector_hint_validated": True, "match_count": 1}]}
+    )
+    target_id = cards[0]["target_id"]
+    generation = runtime.generation_id
+    metadata["semantic_state"]["selected_filters"] = [
+        {"key": "sort", "value": "newest" if filter_changed else "oldest"}
+    ]
+
+    result = _run(getattr(runtime, capture_method)(action_group_id="interaction"))
+
+    assert result["ok"] is True
+    assert runtime.generation_id == generation
+    runtime.validate_reference_values(("e1",))
+    if filter_changed:
+        assert result["page_state"]["listing_stale"] is True
+        assert result["page_state"]["cards"] == []
+        with pytest.raises(ValueError):
+            runtime.resolve_model_target_id(target_id)
+    else:
+        assert runtime.resolve_model_target_id(target_id).selector == "#old-card"
+        assert result["page_state"]["cards"]
 
 
 def test_compact_capture_reuses_content_without_charging_failed_interactions() -> None:
@@ -586,6 +637,7 @@ def test_before_tool_call_rewrites_card_primary_link_click_to_navigation() -> No
 
 def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.normalize_model_batch_steps.side_effect = lambda steps: steps
     rail = BrowserRuntimeRail(runtime)
     agent = MagicMock()
     agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False)
@@ -660,6 +712,7 @@ def test_after_ax_observation_preserves_raw_message_and_registered_refs(
     tool_message = ToolMessage(
         tool_call_id="observation-call",
         content=original_message,
+        metadata={"browser_raw_handle": "a" * 32},
     )
     ctx = AgentCallbackContext(
         agent=MagicMock(),
@@ -674,6 +727,7 @@ def test_after_ax_observation_preserves_raw_message_and_registered_refs(
     _run(rail.after_tool_call(ctx))
 
     assert tool_message.content == original_message
+    assert tool_message.metadata["browser_raw_handle"] == "a" * 32
     assert "Data analytics tender" in tool_message.content
     assert "Closing date: 2026-10-01" in tool_message.content
     if padding_repeats:
@@ -761,6 +815,22 @@ async def test_recent_raw_ax_observations_survive_browser_context_processors(tmp
     assert results[2].content == original_messages[2]
     assert any(message.name == "current_browser_state" for message in window.context_messages)
     assert any(message.name == "browser_working_context" for message in window.context_messages)
+
+
+def test_other_structured_results_keep_upstream_projection() -> None:
+    runtime = _make_bare_runtime()
+    runtime._ensure_page_state().register_cards({"cards": [{"selector": "#cached", "title": "Cached result"}]})
+    rail = BrowserRuntimeRail(runtime)
+    result = {"ok": True, "elements": [{"text": "Search", "selector": "#search", "enabled": True}]}
+    inputs = SimpleNamespace(tool_msg=ToolMessage(content=json.dumps(result), tool_call_id="probe"))
+
+    rail._attach_page_state(inputs, "browser_probe_interactives", result)
+
+    visible = json.loads(inputs.tool_msg.content)
+    assert "cards" not in visible["page_state"]
+    assert "interactives" not in visible["page_state"]
+    assert visible["elements"] == [{"text": "Search", "enabled": True}]
+    assert result["page_state"]["cards"]
 
 
 def test_click_result_url_change_invalidates_snapshot_refs() -> None:
@@ -1292,7 +1362,10 @@ def test_comparison_evidence_requires_distinct_bilibili_sort_slots() -> None:
     assert {slot["variant"] for slot in state["evidence_slots"]} == {"comprehensive", "latest"}
     latest_slot = next(slot for slot in state["evidence_slots"] if slot["variant"] == "latest")
     assert latest_slot == {
+        "query_id": state["task_id"],
+        "entity_source": "https://search.bilibili.com/all?keyword=Python&order=pubdate",
         "entity": "bilibili_search_result",
+        "evidence_scope": "listing",
         "variant": "latest",
         "field": "title",
         "value": "Latest result",
@@ -1359,7 +1432,7 @@ def test_ability_manager_consumes_per_call_skip_without_executing_tool() -> None
     manager._execute_single_tool_call.assert_not_awaited()
 
 
-def test_worker_cannot_claim_completion_without_runtime_field_evidence() -> None:
+def test_worker_cannot_claim_completion_from_field_names_without_observations() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract product title and price")
     state["phases"]["navigation"]["status"] = "completed"
@@ -1375,10 +1448,8 @@ def test_worker_cannot_claim_completion_without_runtime_field_evidence() -> None
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert updated["status"] == "partial"
-    assert updated["blockers"] == [
-        "missing_required_field:price",
-        "missing_required_field:evidence_slot:task_result:default:title",
-    ]
+    assert updated["blockers"] == []
+    assert updated["terminal_reason"] == "no_task_observation"
     assert updated["worker_reported_status"] == "completed"
 
 
@@ -1505,7 +1576,7 @@ def test_ambiguous_evaluate_alias_requires_explicit_target_contract() -> None:
     assert state["field_coverage"] == []
 
 
-def test_missing_evaluate_value_closes_slot_as_unavailable() -> None:
+def test_empty_evaluate_lookup_does_not_prove_field_unavailable() -> None:
     state = BrowserRuntimeRail._build_phase_state("返回商品评分")
 
     BrowserRuntimeRail._record_structured_evidence(
@@ -1515,15 +1586,15 @@ def test_missing_evaluate_value_closes_slot_as_unavailable() -> None:
         tool_args={"target": ".product-rating"},
     )
 
-    assert BrowserRuntimeRail._missing_evidence_slots(state) == []
-    assert BrowserRuntimeRail._unavailable_evidence_slots(state) == [
+    assert BrowserRuntimeRail._missing_evidence_slots(state) == [
         {
             "entity": "product",
             "variant": "default",
             "field": "product_rating",
-            "status": "missing",
         }
     ]
+    assert BrowserRuntimeRail._unavailable_evidence_slots(state) == []
+    assert state["evidence_slots"][0]["observation_status"] == "not_observed"
     assert state["evidence_slots"][0]["source"] == "browser_evaluate"
     assert state["evidence_slots"][0]["generation"] == "g3"
 
@@ -1734,7 +1805,8 @@ def test_extraction_phase_waits_for_all_inferred_required_fields() -> None:
     )
     completed = session.get_state("__browser_phase_budget_state__")
     assert completed["phases"]["extraction"]["status"] == "completed"
-    assert completed["status"] == "completed"
+    assert completed["status"] == "in_progress"
+    assert completed["next_action_class"] == "may_finish"
 
 
 def test_known_url_gate_allows_extraction_when_browser_is_already_on_target() -> None:
@@ -2174,6 +2246,7 @@ def test_required_fields_use_requested_output_clause_not_operation_preconditions
 
 def test_cart_action_feedback_is_sufficient_completion_evidence() -> None:
     state = BrowserRuntimeRail._build_phase_state("打开淘宝把蓝牙耳机加入购物车")
+    state["recent_actions"] = [{"action_class": "form", "outcome": "success"}]
     BrowserWorkingContextStore._merge_semantic_evidence(
         state,
         {
@@ -2195,7 +2268,7 @@ def test_cart_action_feedback_is_sufficient_completion_evidence() -> None:
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert updated["status"] == "completed"
-    assert updated["terminal_reason"] == "runtime_completion_validated"
+    assert updated["terminal_reason"] == "worker_completed_with_observations"
     assert updated["structured_evidence"][-1]["fields"] == ["action_confirmation"]
 
 
@@ -2204,6 +2277,7 @@ def test_large_evaluate_observation_is_bounded() -> None:
     tool_message = ToolMessage(
         content=json.dumps({"value": "x" * 20_000}),
         tool_call_id="evaluate-1",
+        metadata={"browser_raw_handle": "a" * 32},
     )
     inputs = SimpleNamespace(tool_msg=tool_message)
     tool_result = {"ok": True, "value": "x" * 20_000}
@@ -2218,6 +2292,7 @@ def test_large_evaluate_observation_is_bounded() -> None:
     assert len(tool_message.content) <= 12_000
     assert payload["observation"] == "bounded_browser_tool_result"
     assert payload["original_chars"] > 20_000
+    assert payload["recall_handle"] == "a" * 32
 
 
 def test_comprehensive_and_latest_create_distinct_title_slots_without_compare_word() -> None:
@@ -2667,7 +2742,7 @@ def test_after_invoke_renders_authoritative_max_iteration_result() -> None:
     authoritative = result["authoritative_browser_result"]
     assert authoritative["status"] == "partial"
     assert authoritative["terminal_reason"] == "max_iterations_reached"
-    assert "price" in authoritative["missing_fields"]
+    assert "price" in authoritative["unverified_fields"]
     assert "max_iterations_reached" in authoritative["blockers"]
     assert result["error"] == "browser_task_incomplete"
 
