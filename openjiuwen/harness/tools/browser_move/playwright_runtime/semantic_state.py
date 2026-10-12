@@ -242,6 +242,9 @@ def build_semantic_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         normalized_state["action_feedback"] = action_feedback
     if commerce_state:
         normalized_state["commerce_state"] = commerce_state
+    page_content_hash = source.get("page_content_hash")
+    if isinstance(page_content_hash, str) and page_content_hash:
+        normalized_state["page_content_hash"] = page_content_hash
     return normalized_state
 
 
@@ -341,16 +344,18 @@ class SemanticStateTracker:
             self._filter_history and filter_digest in self._filter_history and filter_digest != self._filter_history[-1]
         )
 
+        # Reused filters can reveal new results; complete content takes precedence.
+        revisit_detected = state_revisit or (repeated_filter_state and not semantic_state.get("page_content_hash"))
         if not self._history:
             progress = "initial"
-        elif observation_only and (repeated_state or state_revisit or repeated_filter_state):
+        elif observation_only and (repeated_state or revisit_detected):
             # Inspecting an unchanged or previously seen page is not a failed
             # interaction, and must neither spend nor clear its failure budget.
             progress = "inspection"
         elif repeated_state:
             progress = "no_progress"
             self._consecutive_no_progress += 1
-        elif state_revisit or repeated_filter_state:
+        elif revisit_detected:
             progress = "state_revisit"
             self._consecutive_no_progress += 1
             self._state_revisit_count += 1

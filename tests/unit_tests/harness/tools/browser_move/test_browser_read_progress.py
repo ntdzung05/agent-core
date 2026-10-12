@@ -148,3 +148,20 @@ async def test_read_fallback_capture_preserves_observation_category(browser_flow
     assert runtime.capture_browser_state.await_count == 4
     assert runtime.semantic_progress["consecutive_no_progress"] == 0
     assert session.get_state(BROWSER_TASK_STATE_KEY)["replan_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_after_ambiguous_action_does_not_repeat_reconciliation(browser_flow) -> None:
+    runtime, session, context, processor = browser_flow
+    await _render(context, processor)
+    await _complete_tool(
+        browser_flow, "browser_click", {"ref": "e1"}, result={"ok": False, "executed": True, "state_changed": True}
+    )
+
+    for _ in range(2):
+        await _complete_tool(browser_flow, "browser_snapshot", {})
+
+    assert runtime.capture_browser_state.await_count == 2
+    assert runtime.capture_compact_browser_state.await_count == 2
+    assert runtime.semantic_progress["consecutive_no_progress"] == 1
+    assert session.get_state(BROWSER_TASK_STATE_KEY)["replan_required"] is False

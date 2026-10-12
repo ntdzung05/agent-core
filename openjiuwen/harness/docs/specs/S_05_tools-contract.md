@@ -97,6 +97,8 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
    `unsafe_dev` 与 `advanced_code` 同选时以前者替换后者。不支持图像输入时过滤截图工具。
    取消、健康检查、custom-action discovery 是可显式装配的 Python Tool，不是 capability
    自动注入的工具。runtime 内部 transport 的代码执行器不等于模型可见工具面。
+   `browser_evaluate` 不进入 capability 工具列表；页面读取使用 Probe、snapshot、find 和 Batch 提取，
+   runtime 内部仍可调用该 MCP 工具完成目标标记。
    `browser_probe_cards`、`browser_probe_interactives`、`browser_snapshot`、`browser_find`
    共享显式 observation 分类（`BROWSER_OBSERVATION_TOOL_NAMES` / `is_browser_observation_tool`）。
    未带来新语义信息的读取不增加或清除交互失败计数、不挤出交互循环历史，
