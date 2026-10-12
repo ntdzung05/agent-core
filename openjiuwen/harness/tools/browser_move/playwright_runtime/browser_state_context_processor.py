@@ -83,6 +83,8 @@ _BROWSER_STATE_REFRESH_TOOL_NAMES = frozenset(
         "browser_set_storage_state",
     }
 )
+
+
 class BrowserStateContextProcessorConfig(BaseModel):
     """Configuration for capturing browser state initially and after mutations."""
 
