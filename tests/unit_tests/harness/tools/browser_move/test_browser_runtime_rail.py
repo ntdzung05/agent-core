@@ -1097,7 +1097,7 @@ def test_worker_cannot_claim_completion_from_field_names_without_observations() 
         ("mcp_playwright-official_browser_find", {"text": "next"}),
     ],
 )
-def test_target_discovery_gets_bounded_verification_after_replan_trial(tool_name, tool_args) -> None:
+def test_target_discovery_reads_do_not_reuse_a_failed_strategy_trial(tool_name, tool_args) -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("find the next control")
     state.update(
@@ -1113,12 +1113,12 @@ def test_target_discovery_gets_bounded_verification_after_replan_trial(tool_name
     action_class = BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
     assert action_class == "target_discovery"
 
-    for _ in range(3):
-        assert BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args) == "verification"
-    with pytest.raises(ValueError, match="already ran without verified semantic progress"):
-        BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
+    assert BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args) == "target_discovery"
 
-    assert session.get_state("__browser_phase_budget_state__")["replan_count"] == 1
+    assert state["replan_count"] == 0
+    assert state["replan_required"] is True
+    assert state["replan_trial_pending"] is False
+    assert state["blocked_strategy"] == "target_discovery"
 
 
 def test_evaluate_result_becomes_compact_evidence_before_action_windowing() -> None:
@@ -1640,6 +1640,81 @@ def test_replan_allows_one_bounded_read_only_evidence_recovery() -> None:
     assert action_class == "script_exploration"
     assert updated["status"] == "replan_trial"
     assert updated["read_only_recovery_counts"][strategy] == 1
+
+
+@pytest.mark.parametrize("tool_name", [
+    "browser_probe_cards", "browser_probe_interactives", "browser_snapshot", "browser_find",
+])
+@pytest.mark.parametrize("replan_count,pending", [(0, False), (2, False), (1, True)])
+def test_reads_preserve_interaction_replan_budget_and_strategy(
+    tool_name: str, replan_count: int, pending: bool,
+) -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Read the search form")
+    preserved = {
+        "status": "replan_trial" if pending else "replan_required",
+        "replan_required": True,
+        "replan_count": replan_count,
+        "replan_trial_pending": pending,
+        "trial_strategy": "new-click" if pending else "",
+        "blocked_strategy": "failed-click",
+        "failed_strategies": ["failed-click"],
+        "last_action_class": "interaction",
+        "last_strategy_fingerprint": "failed-click",
+        "next_action_class": "materially_different_strategy",
+    }
+    state.update(preserved)
+    session.update_state({"__browser_phase_budget_state__": state})
+
+    for _ in range(3):
+        BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+
+    assert {key: state[key] for key in preserved} == preserved
+    assert state["replan_denial_count"] == 0
+    assert state["read_only_recovery_counts"] == {}
+    assert sum(phase["attempts"] for phase in state["phases"].values()) == 3
+
+
+@pytest.mark.parametrize("tool_name", [
+    "browser_probe_cards", "browser_probe_interactives", "browser_snapshot", "browser_find",
+])
+def test_reads_retain_phase_and_terminal_limits(tool_name: str) -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Read the current page")
+    for details in state["phases"].values():
+        details["budget"] = 1
+    session.update_state({"__browser_phase_budget_state__": state})
+    BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+
+    with pytest.raises(ValueError, match="phase budget exhausted"):
+        BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+    assert state["status"] == "partial"
+    with pytest.raises(ValueError, match="already partial"):
+        BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+
+
+@pytest.mark.parametrize("tool_name", [
+    "browser_probe_cards", "browser_probe_interactives", "browser_snapshot", "browser_find",
+])
+def test_failed_read_does_not_fail_a_pending_interaction_trial(tool_name: str) -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Read the search form")
+    state.update(
+        status="replan_trial", replan_required=True, replan_trial_pending=True,
+        replan_count=1, trial_strategy="click-search", blocked_strategy="previous-click",
+    )
+    session.update_state({"__browser_phase_budget_state__": state})
+    BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+    BrowserRuntimeRail._record_phase_result(
+        session, tool_name, {}, {"ok": False, "error": "snapshot unavailable"},
+    )
+
+    assert state["status"] == "replan_trial"
+    assert state["replan_trial_pending"] is True
+    assert state["replan_count"] == 1
+    assert state["trial_strategy"] == "click-search"
+    assert state["blocked_strategy"] == "previous-click"
+    assert state["failed_strategies"] == []
 
 
 def test_offload_recall_does_not_consume_browser_phase_or_replan_budget() -> None:
