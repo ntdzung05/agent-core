@@ -76,6 +76,7 @@ from .site_profiles import (
     site_profiles_for_url,
 )
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
+from .tool_categories import is_browser_observation_tool
 
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
@@ -1105,7 +1106,9 @@ class BrowserAgentRuntime:
         self._controller.bind_code_executor(_direct_code_executor)
         self._controller.register_builtin_actions()
 
-    async def capture_browser_state(self, *, action_group_id: str = "") -> Dict[str, Any]:
+    async def capture_browser_state(
+        self, *, action_group_id: str = "", observation_only: bool = False,
+    ) -> Dict[str, Any]:
         """Capture a fresh, non-cached browser observation for the next model call."""
         await self.ensure_runtime_ready()
 
@@ -1154,12 +1157,14 @@ class BrowserAgentRuntime:
                     "progress": "unknown",
                     "observable_progress": False,
                     "capture_error": metadata_error,
+                    "observation_only": observation_only,
                 }
             )
         else:
             semantic_progress = semantic_tracker.observe(
                 semantic_state,
                 action_group_id=action_group_id,
+                observation_only=observation_only,
             )
         semantic_state = self._with_semantic_provenance(
             semantic_progress,
@@ -1283,6 +1288,7 @@ class BrowserAgentRuntime:
         semantic_progress = semantic_tracker.observe(
             semantic_state,
             action_group_id=action_group_id,
+            observation_only=True,
         )
         semantic_state = self._with_semantic_provenance(
             semantic_progress,
@@ -3031,7 +3037,8 @@ class BrowserRuntimeRail(AgentRail):
             replan_group_admitted=bool(group.get("read_only") and group.get("trial_admitted")),
         )
         state = session.get_state(_BROWSER_PHASE_STATE_KEY) if session is not None else None
-        if isinstance(state, dict) and state.get("replan_trial_pending") and group.get("read_only"):
+        trial_pending = isinstance(state, dict) and state.get("replan_trial_pending")
+        if trial_pending and group.get("read_only") and not is_browser_observation_tool(tool_name):
             group["trial_admitted"] = True
         extra = getattr(ctx, "extra", None)
         if isinstance(extra, dict):
@@ -3542,14 +3549,7 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _tool_may_change_browser_state(tool_name: str) -> bool:
-        normalized = str(tool_name or "").strip().lower()
-        observation_tokens = (
-            "browser_probe_cards",
-            "browser_probe_interactives",
-            "browser_snapshot",
-            "browser_find",
-        )
-        return not _contains_any_token(normalized, observation_tokens)
+        return not is_browser_observation_tool(tool_name)
 
     def _canonicalize_tool_name(self, tool_name: str) -> str:
         canonical = canonicalize_playwright_tool_name(tool_name)
@@ -5089,9 +5089,10 @@ class BrowserRuntimeRail(AgentRail):
         details["last_signature"] = signature
         details["last_semantic_signature"] = signature
         state["current_phase"] = phase
-        state["last_action_class"] = action_class
-        state["last_strategy_fingerprint"] = strategy_fingerprint
-        state["next_action_class"] = ""
+        if not is_browser_observation_tool(tool_name):
+            state["last_action_class"] = action_class
+            state["last_strategy_fingerprint"] = strategy_fingerprint
+            state["next_action_class"] = ""
         session.update_state({_BROWSER_PHASE_STATE_KEY: state})
         return action_class
 
@@ -5211,6 +5212,8 @@ class BrowserRuntimeRail(AgentRail):
         strategy_fingerprint: str = "",
     ) -> None:
         cls._reject_terminal_state(state)
+        if is_browser_observation_tool(tool_name):
+            return
         if not state.get("replan_required"):
             return
         if cls._is_replan_exempt_tool(tool_name):
@@ -5386,7 +5389,9 @@ class BrowserRuntimeRail(AgentRail):
                 args,
                 result,
             )
-            cls._record_failed_phase_result(state, details, tool_result)
+            cls._record_failed_phase_result(
+                state, details, tool_result, observation_only=is_browser_observation_tool(tool_name)
+            )
             missing_fields = cls._missing_completion_requirements(state) if phase == "extraction" else []
             if completion_evidence and not missing_fields:
                 cls._complete_phase(state, phases, phase, details, completion_evidence)
@@ -5586,13 +5591,19 @@ class BrowserRuntimeRail(AgentRail):
         )
 
     @staticmethod
-    def _record_failed_phase_result(state: Dict[str, Any], details: Dict[str, Any], tool_result: Any) -> None:
+    def _record_failed_phase_result(
+        state: Dict[str, Any],
+        details: Dict[str, Any],
+        tool_result: Any,
+        *,
+        observation_only: bool = False,
+    ) -> None:
         if str(state.get("status") or "").strip().lower() in _BROWSER_TERMINAL_STATUSES:
             return
         details["status"] = "pending"
         if isinstance(tool_result, dict):
             details["last_error"] = str(tool_result.get("error") or "")[:300]
-        if not state.get("replan_trial_pending"):
+        if observation_only or not state.get("replan_trial_pending"):
             return
         trial_strategy = str(state.get("trial_strategy") or "")
         state["replan_trial_pending"] = False
