@@ -3074,6 +3074,47 @@ async def test_active_teams_can_create_and_join_organization(active_organization
 
 
 @pytest.mark.asyncio
+async def test_control_tools_follow_the_organization_flag(active_organization_runtime):
+    """Control tools mount on the leader only while the flag stays open."""
+    runtime, agents, session_id = active_organization_runtime
+    leader = agents["team-a"]
+
+    await runtime.ensure_control_tools(leader, session_id=session_id)
+    assert any(tool.card.name.startswith("org_") for tool in leader.harness.tools)
+
+    leader.spec.enable_organization = False
+    leader.harness = FakeHarness()
+    await runtime.ensure_control_tools(leader, session_id=session_id)
+    assert not [tool.card.name for tool in leader.harness.tools]
+
+
+@pytest.mark.asyncio
+async def test_team_binding_skips_rehydration_when_organization_disabled(active_organization_runtime):
+    """A closed flag leaves an existing organization binding unrestored."""
+    runtime, agents, session_id = active_organization_runtime
+    leader = agents["team-a"]
+    await runtime.create_organization(
+        organization_id="org-gated",
+        owner_team_id="team-a",
+        session_id=session_id,
+    )
+    assert leader.team_backend.org_task_manager is not None
+
+    leader.spec.enable_organization = False
+    leader.harness = FakeHarness()
+    leader.team_backend.org_task_manager = None
+    bound = await runtime.ensure_team_binding(
+        team_id="team-a",
+        session_id=session_id,
+        agent=leader,
+    )
+
+    assert bound is False
+    assert leader.team_backend.org_task_manager is None
+    assert not [tool.card.name for tool in leader.harness.tools]
+
+
+@pytest.mark.asyncio
 async def test_joined_leader_is_woken_to_consider_open_org_task(active_organization_runtime):
     runtime, agents, session_id = active_organization_runtime
     await runtime.create_organization(
@@ -4375,6 +4416,9 @@ async def test_completed_task_rewakes_team_for_matching_open_task(active_organiz
 @pytest.mark.asyncio
 async def test_owner_can_dissolve_organization_and_recreate_it(active_organization_runtime):
     runtime, agents, session_id = active_organization_runtime
+    agents["team-a"].spec.metadata["agent_group_name"] = "owner-group"
+    teammate = FakeAgent(agents["team-a"].team_backend)
+    agents["team-a"].spawn_manager = SimpleNamespace(spawned_handles={"member": SimpleNamespace(agent_ref=teammate)})
     await runtime.create_organization(
         organization_id="org-dissolve",
         owner_team_id="team-a",
@@ -4409,6 +4453,11 @@ async def test_owner_can_dissolve_organization_and_recreate_it(active_organizati
     assert result["deleted"]["tasks"] == 1
     assert agents["team-a"].team_backend.org_task_manager is None
     assert agents["team-b"].team_backend.org_task_manager is None
+    for agent in (agents["team-a"], agents["team-b"], teammate):
+        assert "organization_id" not in agent.spec.metadata
+        assert "organization_session_id" not in agent.spec.metadata
+        assert agent.spec.metadata["capabilities"] == ["analysis"]
+    assert agents["team-a"].spec.metadata["agent_group_name"] == "owner-group"
     assert "organization_owner_lifecycle" not in agents["team-a"].harness.system_prompt_builder.sections
     assert "org_view_tasks" not in {tool.card.name for tool in agents["team-a"].harness.tools}
     assert await manager.get_organization() is None
@@ -4419,6 +4468,7 @@ async def test_owner_can_dissolve_organization_and_recreate_it(active_organizati
         session_id=session_id,
     )
     assert recreated.organization_id == "org-dissolve"
+    assert agents["team-a"].spec.metadata["organization_id"] == "org-dissolve"
 
 
 @pytest.mark.asyncio

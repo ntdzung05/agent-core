@@ -92,8 +92,8 @@ def _make_bare_runtime() -> BrowserAgentRuntime:
 def _make_capture_runtime() -> BrowserAgentRuntime:
     runtime = _make_bare_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._call_playwright_tool = AsyncMock(return_value='- button "Filters" [ref=e1]')
-    runtime._call_playwright_run_code_unsafe = AsyncMock(
+    runtime.call_playwright_tool = AsyncMock(return_value='- button "Filters" [ref=e1]')
+    runtime.call_playwright_run_code_unsafe = AsyncMock(
         return_value={
             "ok": True,
             "url": "https://tenders.example/results",
@@ -119,7 +119,7 @@ def test_complete_capture_detects_later_results_beyond_context_limits(
         '    - link "Details" [ref=e3]:\n      - /url: https://tenders.example/details'
         for index in range(4)
     ]
-    runtime._call_playwright_tool.side_effect = [
+    runtime.call_playwright_tool.side_effect = [
         json.dumps({"result": {"content": [{"type": "text", "text": snapshot}]}})
         if wrapped_result
         else snapshot
@@ -142,12 +142,12 @@ def test_complete_capture_detects_later_results_beyond_context_limits(
         assert "Details" in state["dom"]
         assert f"Tender {index} closes October" not in state["dom"]
         runtime.validate_reference_values(("e3",))
-        target = runtime._ensure_page_state().resolve_target(generation_id=runtime.generation_id, ref="e3")
+        target = runtime.ensure_page_state().resolve_target(generation_id=runtime.generation_id, ref="e3")
         assert target.name == "Details"
         runtime.persist_observation.assert_any_await(snapshots[index], "browser_snapshot")
 
-    assert runtime._call_playwright_tool.await_count == 4
-    assert runtime._call_playwright_run_code_unsafe.await_count == 4
+    assert runtime.call_playwright_tool.await_count == 4
+    assert runtime.call_playwright_run_code_unsafe.await_count == 4
     if capture_method == "capture_reconciliation_browser_state":
         assert state["reconciliation_only"] is True
 
@@ -156,10 +156,10 @@ def test_complete_capture_detects_later_results_beyond_context_limits(
 @pytest.mark.parametrize("filter_changed", [False, True])
 def test_capture_invalidates_only_changed_listing_targets(capture_method: str, filter_changed: bool) -> None:
     runtime = _make_capture_runtime()
-    metadata = runtime._call_playwright_run_code_unsafe.return_value
+    metadata = runtime.call_playwright_run_code_unsafe.return_value
     metadata["semantic_state"]["selected_filters"] = [{"key": "sort", "value": "oldest"}]
     _run(runtime.capture_browser_state(action_group_id="initial"))
-    page_state = runtime._ensure_page_state()
+    page_state = runtime.ensure_page_state()
     cards = page_state.register_cards(
         {"cards": [{"selector_hint": "#old-card", "selector_hint_validated": True, "match_count": 1}]}
     )
@@ -197,9 +197,9 @@ def test_compact_capture_reuses_content_without_charging_failed_interactions() -
         assert state["semantic_progress"]["consecutive_no_progress"] == 0
         assert state["semantic_progress"]["replan_required"] is False
 
-    runtime._call_playwright_tool.assert_awaited_once()
-    runtime._call_playwright_run_code_unsafe.assert_awaited_once()
-    runtime._ensure_page_state().add_field_coverage(["closing_date"])
+    runtime.call_playwright_tool.assert_awaited_once()
+    runtime.call_playwright_run_code_unsafe.assert_awaited_once()
+    runtime.ensure_page_state().add_field_coverage(["closing_date"])
     evidence = _run(runtime.capture_compact_browser_state(action_group_id="new-evidence"))
     assert evidence["semantic_progress"]["progress"] == "progress"
     assert evidence["semantic_progress"]["changed_fields"] == ["field_coverage"]
@@ -211,7 +211,7 @@ def test_full_capture_for_read_preserves_failed_interaction_budget(capture_fails
     _run(runtime.capture_browser_state(action_group_id="initial"))
     _run(runtime.capture_browser_state(action_group_id="failed-interaction"))
     if capture_fails:
-        runtime._call_playwright_tool.side_effect = RuntimeError("snapshot unavailable")
+        runtime.call_playwright_tool.side_effect = RuntimeError("snapshot unavailable")
 
     for index in range(3):
         captured = _run(runtime.capture_browser_state(action_group_id=f"read-{index}", observation_only=True))
@@ -228,18 +228,18 @@ def test_failed_capture_invalidates_compact_content_without_advancing_history(fa
     _run(runtime.capture_browser_state(action_group_id="initial"))
     _run(runtime.capture_compact_browser_state(action_group_id="inspect"))
     before = runtime.semantic_progress
-    metadata = runtime._call_playwright_run_code_unsafe.return_value
+    metadata = runtime.call_playwright_run_code_unsafe.return_value
     if failure == "snapshot_exception":
-        runtime._call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
+        runtime.call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
     elif failure == "invalid_snapshot":
-        runtime._call_playwright_tool.return_value = "### Error\nBrowser disconnected"
+        runtime.call_playwright_tool.return_value = "### Error\nBrowser disconnected"
     elif failure == "error_envelope":
-        runtime._call_playwright_tool.return_value = {
+        runtime.call_playwright_tool.return_value = {
             "isError": True,
             "content": [{"type": "text", "text": '- button "Filters" [ref=e1]'}],
         }
     else:
-        runtime._call_playwright_run_code_unsafe.side_effect = RuntimeError("metadata timeout")
+        runtime.call_playwright_run_code_unsafe.side_effect = RuntimeError("metadata timeout")
 
     failed = _run(runtime.capture_browser_state(action_group_id="failed-action"))
     compact = _run(runtime.capture_compact_browser_state(action_group_id="inspection-after-failure"))
@@ -255,10 +255,10 @@ def test_failed_capture_invalidates_compact_content_without_advancing_history(fa
         assert "page_content_hash" not in state["semantic_progress"]["semantic_state"]
     assert runtime.semantic_progress == before
 
-    runtime._call_playwright_tool.side_effect = None
-    runtime._call_playwright_tool.return_value = '- button "Filters" [ref=e99]'
-    runtime._call_playwright_run_code_unsafe.side_effect = None
-    runtime._call_playwright_run_code_unsafe.return_value = metadata
+    runtime.call_playwright_tool.side_effect = None
+    runtime.call_playwright_tool.return_value = '- button "Filters" [ref=e99]'
+    runtime.call_playwright_run_code_unsafe.side_effect = None
+    runtime.call_playwright_run_code_unsafe.return_value = metadata
     recovered = _run(runtime.capture_browser_state(action_group_id="successful-capture"))
     assert recovered["semantic_progress"]["revision"] == before["revision"] + 1
     assert recovered["semantic_progress"]["progress"] == "no_progress"
@@ -271,9 +271,9 @@ def test_compact_capture_rejects_content_from_a_different_page_or_task(invalidat
     runtime = _make_capture_runtime()
     _run(runtime.capture_browser_state(action_group_id="initial"))
     if invalidate == "generation":
-        runtime._observe_page_url("https://tenders.example/results", force_navigation=True)
+        runtime.observe_page_url("https://tenders.example/results", force_navigation=True)
     elif invalidate == "url":
-        runtime._ensure_page_state().observe(url="https://tenders.example/new-page")
+        runtime.ensure_page_state().observe(url="https://tenders.example/new-page")
     else:
         runtime.reset_semantic_task()
     before = runtime.semantic_progress
@@ -283,7 +283,7 @@ def test_compact_capture_rejects_content_from_a_different_page_or_task(invalidat
     assert compact["semantic_progress"]["progress"] == "unknown"
     assert "page_content_hash" not in compact["semantic_state"]
     assert runtime.semantic_progress == before
-    runtime._ensure_page_state().observe(url="https://tenders.example/results")
+    runtime.ensure_page_state().observe(url="https://tenders.example/results")
     repeated = _run(runtime.capture_compact_browser_state(action_group_id="repeated-inspection"))
     assert repeated["semantic_progress"]["progress"] == "unknown"
     assert runtime.semantic_progress == before
@@ -291,7 +291,7 @@ def test_compact_capture_rejects_content_from_a_different_page_or_task(invalidat
 
 def test_compact_capture_without_complete_baseline_does_not_start_history() -> None:
     runtime = _make_bare_runtime()
-    runtime._ensure_page_state().observe(url="https://tenders.example/results")
+    runtime.ensure_page_state().observe(url="https://tenders.example/results")
 
     compact = _run(runtime.capture_compact_browser_state(action_group_id="inspection"))
 
@@ -303,8 +303,8 @@ def test_compact_capture_without_complete_baseline_does_not_start_history() -> N
 def test_failed_navigation_capture_does_not_relabel_previous_page_content() -> None:
     runtime = _make_capture_runtime()
     initial = _run(runtime.capture_browser_state(action_group_id="initial"))
-    runtime._call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
-    runtime._call_playwright_run_code_unsafe.return_value = {
+    runtime.call_playwright_tool.side_effect = RuntimeError("snapshot timeout")
+    runtime.call_playwright_run_code_unsafe.return_value = {
         "ok": True,
         "url": "https://tenders.example/other-page",
     }
@@ -735,7 +735,7 @@ def test_after_ax_observation_preserves_raw_message_and_registered_refs(
         assert "Data analytics tender" not in original_message[:6_000] + original_message[-2_000:]
 
     runtime.validate_reference_values(("f1e2", "f1e3"))
-    page_state = runtime._ensure_page_state()
+    page_state = runtime.ensure_page_state()
     target = page_state.resolve_target(generation_id=runtime.generation_id, ref="f1e3")
     assert target.ref == "f1e3"
     assert rail._normalize_playwright_ref_args(
@@ -819,7 +819,7 @@ async def test_recent_raw_ax_observations_survive_browser_context_processors(tmp
 
 def test_other_structured_results_keep_upstream_projection() -> None:
     runtime = _make_bare_runtime()
-    runtime._ensure_page_state().register_cards({"cards": [{"selector": "#cached", "title": "Cached result"}]})
+    runtime.ensure_page_state().register_cards({"cards": [{"selector": "#cached", "title": "Cached result"}]})
     rail = BrowserRuntimeRail(runtime)
     result = {"ok": True, "elements": [{"text": "Search", "selector": "#search", "enabled": True}]}
     inputs = SimpleNamespace(tool_msg=ToolMessage(content=json.dumps(result), tool_call_id="probe"))
@@ -900,7 +900,7 @@ def test_compact_rpc_wrapper_is_transparent_to_probe_parsing() -> None:
         "rpc_metrics": {"transport_invoke_elapsed_ms": 4},
     }
 
-    assert runtime._unwrap_mcp_text_result(raw) == ('{"ok":true,"elements":[]}')
+    assert runtime.unwrap_mcp_text_result(raw) == ('{"ok":true,"elements":[]}')
 
 
 @pytest.mark.parametrize(
@@ -943,7 +943,7 @@ def test_direct_mcp_target_id_is_resolved_and_runtime_fields_are_removed() -> No
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(payload)
+    runtime.ensure_page_state().register_interactives(payload)
     target_id = payload["elements"][0]["target_id"]
     rail = BrowserRuntimeRail(runtime)
 
@@ -990,7 +990,7 @@ def test_direct_mcp_target_is_refreshed_when_runtime_identity_is_unique() -> Non
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(first)
+    runtime.ensure_page_state().register_interactives(first)
     stale_target_id = first["elements"][0]["target_id"]
     runtime._advance_page_generation()
     current = {
@@ -1005,7 +1005,7 @@ def test_direct_mcp_target_is_refreshed_when_runtime_identity_is_unique() -> Non
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(current)
+    runtime.ensure_page_state().register_interactives(current)
     rail = BrowserRuntimeRail(runtime)
 
     normalized = rail._normalize_playwright_ref_args(
@@ -1028,7 +1028,7 @@ def test_primary_link_target_is_rewritten_to_direct_navigation() -> None:
             }
         ]
     }
-    runtime._ensure_page_state().register_cards(payload)
+    runtime.ensure_page_state().register_cards(payload)
     target_id = payload["cards"][0]["primary_link_target_id"]
     rail = BrowserRuntimeRail(runtime)
     ctx = AgentCallbackContext(
@@ -1063,6 +1063,21 @@ def test_phase_plan_uses_explicit_completion_conditions_and_large_budgets() -> N
     assert BrowserRuntimeRail._build_phase_state("对比两个页面的信息")["task_type"] == "complex"
 
 
+@pytest.mark.parametrize("task", [
+    "去trip.com帮我订一下下周一到周三住在香港的酒店，带早饭，预算200美元/晚，直接到付款界面等我付款即可",
+    "go to lazada.com and buy me ingredients for spaghetti carbonara. stop just before you make payment.",
+    "去lazada.com帮我买做意大利培根蛋酱面的食材，在付款之前停下来。",
+])
+def test_buying_and_booking_tasks_get_the_complex_budget(task) -> None:
+    # Classified "simple", these ran out of their 32-step budget before reaching checkout.
+    assert BrowserRuntimeRail._build_phase_state(task)["task_type"] == "complex"
+
+
+def test_read_only_lookup_stays_simple() -> None:
+    assert BrowserRuntimeRail._build_phase_state("打开百度首页，搜索“西安天气”，返回结果页中今天的最高温和最低温。")[
+        "task_type"] == "simple"
+
+
 def test_shared_deadline_bounds_each_invocation_without_forcing_a_resume() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     rail = BrowserRuntimeRail(runtime)
@@ -1084,7 +1099,7 @@ def test_shared_deadline_bounds_each_invocation_without_forcing_a_resume() -> No
         assert remaining < 720.0
 
 
-def test_known_url_must_be_navigated_before_selector_exploration() -> None:
+def test_known_url_is_guidance_and_does_not_refuse_an_initial_snapshot() -> None:
     session = _FakeSession()
     session.update_state(
         {
@@ -1094,29 +1109,28 @@ def test_known_url_must_be_navigated_before_selector_exploration() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="Navigate to it directly"):
-        BrowserRuntimeRail._consume_phase_budget(
-            session,
-            "mcp_playwright_browser_snapshot",
-            {},
-        )
+    BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "mcp_playwright_browser_snapshot",
+        {},
+    )
 
 
-def test_exhausted_phase_budget_requires_replan() -> None:
+def test_phase_threshold_does_not_terminate_navigation() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Search for OpenJiuwen")
     state["phases"]["navigation"]["attempts"] = state["phases"]["navigation"]["budget"]
     session.update_state({"__browser_phase_budget_state__": state})
 
-    with pytest.raises(ValueError, match="budget exhausted"):
-        BrowserRuntimeRail._consume_phase_budget(
-            session,
-            "mcp_playwright_browser_navigate",
-            {"url": "https://www.baidu.com/s?wd=OpenJiuwen"},
-        )
+    BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "mcp_playwright_browser_navigate",
+        {"url": "https://www.baidu.com/s?wd=OpenJiuwen"},
+    )
 
     phase = session.get_state("__browser_phase_budget_state__")["phases"]["navigation"]
-    assert phase["status"] == "replan_required"
+    assert phase["status"] == "in_progress"
+    assert phase["attempts"] == 13
 
 
 def test_batch_phase_signature_changes_when_steps_change() -> None:
@@ -1192,8 +1206,8 @@ def test_phase_attempts_do_not_reset_after_material_replan() -> None:
     assert action_class == "filtering"
     assert updated["attempts"] == 4
     task_state = session.get_state("__browser_phase_budget_state__")
-    assert task_state["replan_count"] == 1
-    assert task_state["replan_trial_pending"] is True
+    assert task_state["replan_count"] == 0
+    assert not task_state["replan_trial_pending"]
 
 
 def test_semantic_loop_marks_current_phase_replan_required() -> None:
@@ -1333,6 +1347,7 @@ def test_terminal_state_returns_structured_denial(status: str) -> None:
 
 def test_comparison_evidence_requires_distinct_bilibili_sort_slots() -> None:
     state = BrowserRuntimeRail._build_phase_state("对比B站 Python 搜索综合和最新结果的标题")
+    _declare_output(state, ['title'], entity='bilibili_search_result', variants=('comprehensive', 'latest'))
     comprehensive = {
         "generation_id": "g2",
         "page_state": {"url": "https://search.bilibili.com/all?keyword=Python"},
@@ -1461,7 +1476,7 @@ def test_worker_cannot_claim_completion_from_field_names_without_observations() 
         ("mcp_playwright-official_browser_find", {"text": "next"}),
     ],
 )
-def test_target_discovery_reads_do_not_reuse_a_failed_strategy_trial(tool_name, tool_args) -> None:
+def test_target_discovery_does_not_need_semantic_progress_proof(tool_name, tool_args) -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("find the next control")
     state.update(
@@ -1477,17 +1492,17 @@ def test_target_discovery_reads_do_not_reuse_a_failed_strategy_trial(tool_name, 
     action_class = BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
     assert action_class == "target_discovery"
 
-    assert BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args) == "target_discovery"
+    for _ in range(3):
+        assert BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args) == "target_discovery"
+    BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
 
-    assert state["replan_count"] == 0
-    assert state["replan_required"] is True
-    assert state["replan_trial_pending"] is False
-    assert state["blocked_strategy"] == "target_discovery"
+    assert session.get_state("__browser_phase_budget_state__")["replan_count"] == 0
 
 
 def test_evaluate_result_becomes_compact_evidence_before_action_windowing() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("extract the title")
+    _declare_output(state, ['title'], entity='task_result', variants=('default',))
     session.update_state({"__browser_phase_budget_state__": state})
     function = "() => ({title: document.title, count: 3})"
 
@@ -1522,6 +1537,7 @@ def test_targeted_evaluate_maps_only_requested_fields_with_provenance() -> None:
     state = BrowserRuntimeRail._build_phase_state(
         "返回文章作者、评论数和当前排序状态"
     )
+    _declare_output(state, ['author', 'comments', 'sort_state'], entity='task_result', variants=('default',))
 
     BrowserRuntimeRail._record_structured_evidence(
         state,
@@ -1578,6 +1594,7 @@ def test_ambiguous_evaluate_alias_requires_explicit_target_contract() -> None:
 
 def test_empty_evaluate_lookup_does_not_prove_field_unavailable() -> None:
     state = BrowserRuntimeRail._build_phase_state("返回商品评分")
+    _declare_output(state, ['product_rating'], entity='product', variants=('default',))
 
     BrowserRuntimeRail._record_structured_evidence(
         state,
@@ -1631,6 +1648,8 @@ def test_interactive_probe_sort_evidence_keeps_selection_source() -> None:
 def test_probe_contract_exposes_result_count_and_bounds_conflict_fallback() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("返回前3条搜索结果")
+    _declare_output(state, [], entity='task_result', variants=('default',))
+    state["requested_result_count"] = 3
     session.update_state({"__browser_phase_budget_state__": state})
     first = {
         "observed_count": 1,
@@ -1687,7 +1706,11 @@ def test_probe_contract_exposes_result_count_and_bounds_conflict_fallback() -> N
 
 def test_generation_or_selector_changes_do_not_create_new_semantic_evidence() -> None:
     session = _FakeSession()
-    session.update_state({"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("extract title")})
+    session.update_state({
+        "__browser_phase_budget_state__": _declare_output(
+            BrowserRuntimeRail._build_phase_state("extract title"), ["title"]
+        )
+    })
     first = BrowserRuntimeRail._record_phase_result(
         session,
         "browser_evaluate",
@@ -1725,29 +1748,29 @@ def test_recent_action_window_is_runtime_owned_and_bounded_to_six() -> None:
     assert [action["seq"] for action in actions] == [3, 4, 5, 6, 7, 8]
 
 
-def test_same_price_interval_cannot_be_visited_twice() -> None:
+def test_price_interval_history_does_not_prohibit_current_user_actions() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Filter products from 100 to 200 yuan")
     state["current_phase"] = "filtering"
     state["phases"]["filtering"]["visited_price_intervals"] = ["100:200"]
     session.update_state({"__browser_phase_budget_state__": state})
 
-    with pytest.raises(ValueError, match="already visited"):
-        BrowserRuntimeRail._consume_phase_budget(
-            session,
-            "browser_batch_interact",
-            {
-                "steps": [
-                    {"op": "fill", "name": "minimum price", "value": "100"},
-                    {"op": "fill", "name": "maximum price", "value": "200"},
-                ]
-            },
-        )
+    BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "browser_batch_interact",
+        {
+            "steps": [
+                {"op": "fill", "name": "minimum price", "value": "100"},
+                {"op": "fill", "name": "maximum price", "value": "200"},
+            ]
+        },
+    )
 
 
 def test_structured_extraction_records_task_scoped_evidence() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract product title and price")
+    _declare_output(state, ['title', 'price'], entity='task_result', variants=('default',))
     state["current_phase"] = "extraction"
     session.update_state({"__browser_phase_budget_state__": state})
 
@@ -1780,9 +1803,10 @@ def test_structured_extraction_records_task_scoped_evidence() -> None:
     assert prompt_evidence[0]["provenance"]["title"]["selector"] == "h2.product-title"
 
 
-def test_extraction_phase_waits_for_all_inferred_required_fields() -> None:
+def test_explicit_extraction_contract_waits_for_declared_fields() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract product title and price")
+    _declare_output(state, ['title', 'price'], entity='task_result', variants=('default',))
     state["current_phase"] = "extraction"
     state["phases"]["navigation"]["status"] = "completed"
     session.update_state({"__browser_phase_budget_state__": state})
@@ -1825,18 +1849,17 @@ def test_known_url_gate_allows_extraction_when_browser_is_already_on_target() ->
     assert session.get_state("__browser_phase_budget_state__")["phases"]["extraction"]["attempts"] == 1
 
 
-def test_known_url_gate_guides_once_then_leaves_recovery_to_model() -> None:
+def test_known_url_does_not_gate_reading_a_different_current_page() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Open https://example.test and extract the title")
     session.update_state({"__browser_phase_budget_state__": state})
 
-    with pytest.raises(ValueError, match="https://example.test"):
-        BrowserRuntimeRail._consume_phase_budget(
-            session,
-            "browser_probe_cards",
-            {},
-            current_page_state={"url": "about:blank"},
-        )
+    BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "browser_probe_cards",
+        {},
+        current_page_state={"url": "about:blank"},
+    )
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
@@ -1846,8 +1869,8 @@ def test_known_url_gate_guides_once_then_leaves_recovery_to_model() -> None:
     )
     updated = session.get_state("__browser_phase_budget_state__")
     assert action_class == "structured_extraction"
-    assert updated["direct_navigation_guidance_count"] == 1
-    assert updated["phases"]["extraction"]["attempts"] == 1
+    assert updated["direct_navigation_guidance_count"] == 0
+    assert updated["phases"]["extraction"]["attempts"] == 2
 
 
 def test_known_root_url_gate_accepts_deeper_same_site_page() -> None:
@@ -1902,8 +1925,8 @@ def test_replan_fingerprint_allows_a_different_requested_field() -> None:
 
     assert action_class == "script_exploration"
     updated = session.get_state("__browser_phase_budget_state__")
-    assert updated["status"] == "replan_trial"
-    assert updated["replan_count"] == 1
+    assert updated["status"] == "replan_required"
+    assert updated["replan_count"] == 0
 
 
 def test_strategy_fingerprint_tracks_semantic_target_without_generation_noise() -> None:
@@ -1948,7 +1971,7 @@ def test_strategy_fingerprint_tracks_semantic_target_without_generation_noise() 
     assert first == refreshed_first
 
 
-def test_repeated_replan_denials_become_terminal_after_finite_budget() -> None:
+def test_failed_strategy_diagnostics_do_not_manufacture_terminal_state() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract the title")
     args = {"function": "() => document.querySelector('button').click()", "target": "ref=e1"}
@@ -1969,16 +1992,15 @@ def test_repeated_replan_denials_become_terminal_after_finite_budget() -> None:
     session.update_state({"__browser_phase_budget_state__": state})
 
     for _ in range(3):
-        with pytest.raises(ValueError, match="Semantic loop detected"):
-            BrowserRuntimeRail._consume_phase_budget(session, "browser_evaluate", args)
+        BrowserRuntimeRail._consume_phase_budget(session, "browser_evaluate", args)
 
     updated = session.get_state("__browser_phase_budget_state__")
-    assert updated["status"] == "blocked"
-    assert updated["replan_denial_count"] == 3
-    assert "semantic_replan_denial_budget_exhausted" in updated["blockers"]
+    assert updated["status"] == "replan_required"
+    assert updated["replan_denial_count"] == 0
+    assert "semantic_replan_denial_budget_exhausted" not in updated["blockers"]
 
 
-def test_replan_allows_one_bounded_read_only_evidence_recovery() -> None:
+def test_read_recovery_has_no_separate_proof_counter() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract the title")
     args = {"function": "() => ({title: document.title})", "field": "title"}
@@ -2002,8 +2024,8 @@ def test_replan_allows_one_bounded_read_only_evidence_recovery() -> None:
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert action_class == "script_exploration"
-    assert updated["status"] == "replan_trial"
-    assert updated["read_only_recovery_counts"][strategy] == 1
+    assert updated["status"] == "replan_required"
+    assert not updated["read_only_recovery_counts"]
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -2042,7 +2064,7 @@ def test_reads_preserve_interaction_replan_budget_and_strategy(
 @pytest.mark.parametrize("tool_name", [
     "browser_probe_cards", "browser_probe_interactives", "browser_snapshot", "browser_find",
 ])
-def test_reads_retain_phase_and_terminal_limits(tool_name: str) -> None:
+def test_reads_retain_advisory_phase_costs_and_terminal_guard(tool_name: str) -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Read the current page")
     for details in state["phases"].values():
@@ -2050,9 +2072,10 @@ def test_reads_retain_phase_and_terminal_limits(tool_name: str) -> None:
     session.update_state({"__browser_phase_budget_state__": state})
     BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
 
-    with pytest.raises(ValueError, match="phase budget exhausted"):
-        BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
-    assert state["status"] == "partial"
+    BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
+    assert sum(details["attempts"] for details in state["phases"].values()) == 2
+    assert state["status"] not in {"partial", "blocked"}
+    state["status"] = "partial"
     with pytest.raises(ValueError, match="already partial"):
         BrowserRuntimeRail._consume_phase_budget(session, tool_name, {})
 
@@ -2135,6 +2158,7 @@ def test_new_structured_evidence_recovers_pending_replan_trial() -> None:
 def test_partial_batch_keeps_successful_extraction_without_marking_batch_success() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract the title and price")
+    _declare_output(state, ['title', 'price'], entity='task_result', variants=('default',))
     session.update_state({"__browser_phase_budget_state__": state})
 
     result = BrowserRuntimeRail._record_phase_result(
@@ -2164,20 +2188,6 @@ def test_partial_batch_keeps_successful_extraction_without_marking_batch_success
     assert "price" not in updated["field_coverage"]
 
 
-def test_price_interval_ignores_evaluate_script_numbers() -> None:
-    assert BrowserRuntimeRail._price_interval_signature(
-        "browser_evaluate",
-        {"function": "() => [...document.querySelectorAll('.price')].slice(1, 2)"},
-    ) == ""
-    assert BrowserRuntimeRail._price_interval_signature(
-        "browser_batch_interact",
-        {
-            "steps": [
-                {"op": "fill", "field": "minimum price", "value": "100"},
-                {"op": "fill", "field": "maximum price", "value": "200"},
-            ]
-        },
-    ) == "100:200"
 
 
 def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() -> None:
@@ -2195,6 +2205,7 @@ def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() ->
         "low_temperature",
         "sort_state",
     }
+    _declare_output(state, sorted(expected_fields))
     assert set(state["required_fields"]) == expected_fields
     assert {slot["field"] for slot in state["required_evidence_slots"]} == expected_fields
 
@@ -2227,24 +2238,11 @@ def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() ->
     assert slots["author"]["raw_text"] == "作者 Alice"
     assert slots["author"]["generation"] == "g8"
     assert slots["likes"]["source"] == "browser_batch_interact"
-    assert BrowserRuntimeRail._infer_required_fields("提取商品评分和店铺评分") == [
-        "product_rating",
-        "shop_rating",
-    ]
 
 
-def test_required_fields_use_requested_output_clause_not_operation_preconditions() -> None:
-    task = "打开淘宝搜索机械键盘，可以按价格或销量排序，返回第一条商品标题"
-    assert BrowserRuntimeRail._infer_required_fields(task) == ["title"]
-    assert BrowserRuntimeRail._infer_required_fields(
-        "打开百度查看天气，返回最高温和最低温"
-    ) == ["high_temperature", "low_temperature"]
-    assert BrowserRuntimeRail._infer_required_fields("查询美元兑人民币并返回汇率") == ["exchange_rate"]
-    assert BrowserRuntimeRail._infer_required_fields("搜索 Python 视频，返回播放量") == ["views"]
-    assert BrowserRuntimeRail._infer_required_fields("打开淘宝把蓝牙耳机加入购物车") == []
 
 
-def test_cart_action_feedback_is_sufficient_completion_evidence() -> None:
+def test_cart_action_feedback_is_preserved_but_does_not_prove_sku_delta() -> None:
     state = BrowserRuntimeRail._build_phase_state("打开淘宝把蓝牙耳机加入购物车")
     state["recent_actions"] = [{"action_class": "form", "outcome": "success"}]
     BrowserWorkingContextStore._merge_semantic_evidence(
@@ -2268,8 +2266,9 @@ def test_cart_action_feedback_is_sufficient_completion_evidence() -> None:
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert updated["status"] == "completed"
-    assert updated["terminal_reason"] == "worker_completed_with_observations"
-    assert updated["structured_evidence"][-1]["fields"] == ["action_confirmation"]
+    assert not updated["blockers"]
+    assert not updated.get("phase_requirements")
+    assert updated["structured_evidence"][-1]["fields"] == ["action_feedback"]
 
 
 def test_large_evaluate_observation_is_bounded() -> None:
@@ -2295,14 +2294,6 @@ def test_large_evaluate_observation_is_bounded() -> None:
     assert payload["recall_handle"] == "a" * 32
 
 
-def test_comprehensive_and_latest_create_distinct_title_slots_without_compare_word() -> None:
-    slots = BrowserRuntimeRail._infer_required_evidence_slots(
-        "在B站分别切换综合排序和最新发布，返回两个标题"
-    )
-    assert slots == [
-        {"entity": "bilibili_search_result", "variant": "comprehensive", "field": "title"},
-        {"entity": "bilibili_search_result", "variant": "latest", "field": "title"},
-    ]
 
 
 def test_terminal_state_allows_one_tool_disabled_synthesis_then_force_finishes() -> None:
@@ -2650,7 +2641,8 @@ def test_after_tool_call_does_not_advance_state_for_string_mcp_error() -> None:
 
     assert ctx.inputs.tool_result["ok"] is False
     assert tool_message.metadata["success"] is False
-    assert tool_message.metadata["executed"] is True
+    assert tool_message.metadata["executed"] is None
+    assert tool_message.metadata["execution_state"] == "dispatched_unknown"
     assert tool_message.metadata["state_changed"] is False
     state = session.get_state("__browser_phase_budget_state__")
     assert state["recent_actions"][-1]["outcome_status"] == "failed"
@@ -2742,7 +2734,7 @@ def test_after_invoke_renders_authoritative_max_iteration_result() -> None:
     authoritative = result["authoritative_browser_result"]
     assert authoritative["status"] == "partial"
     assert authoritative["terminal_reason"] == "max_iterations_reached"
-    assert "price" in authoritative["unverified_fields"]
+    assert "unverified_fields" not in authoritative
     assert "max_iterations_reached" in authoritative["blockers"]
     assert result["error"] == "browser_task_incomplete"
 
@@ -2813,3 +2805,12 @@ def test_after_invoke_cannot_override_runtime_terminal_state_without_progress_bl
     assert result["result_type"] == "error"
     assert result["failure_summary"] == "runtime blocked: captcha"
     assert session.get_state("__browser_phase_budget_state__")["blockers"] == ["captcha"]
+
+
+def _declare_output(state, fields, *, entity="task_result", variants=("default",)):
+    """An externally declared output contract, independent of natural-language inference."""
+    state.update(requirements_source="explicit", required_fields=list(fields), required_evidence_slots=[
+        {"entity": entity, "variant": variant, "field": field}
+        for variant in variants for field in fields
+    ])
+    return state

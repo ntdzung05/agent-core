@@ -22,23 +22,55 @@ if TYPE_CHECKING:
     from openjiuwen.agent_teams.tools.member_options import MemberBuiltinModel
 
 
+def validate_member_name(member_name: str | None) -> str | None:
+    """Validate ``member_name`` at the tool boundary.
+
+    Returns:
+        An error message when the name is missing or malformed,
+        otherwise ``None``.
+    """
+    if member_name and _MEMBER_NAME_PATTERN.match(member_name):
+        return None
+    return (
+        f"Invalid member_name {member_name!r}: must start with a "
+        "lowercase ASCII letter (a-z), followed by lowercase letters, "
+        "digits (0-9) or hyphen (-); no uppercase, underscore, "
+        "whitespace, or non-ASCII characters (including CJK) — "
+        "member_name is reused as a routing token and a filesystem "
+        "path segment"
+    )
+
+
 def _is_anthropic_provider(provider: str) -> bool:
     """Return whether a provider name is Anthropic-compatible."""
-    return "anthropic" in provider.lower()
+    from openjiuwen.agent_teams.external.cli_agent.model_compat import is_anthropic_provider
+
+    return is_anthropic_provider(provider)
 
 
 def _provider_filter_for_cli(cli_agent: str) -> Callable[[str], bool] | None:
     """Return a provider filter for the CLI kind, or None for unknown kinds."""
-    if cli_agent == "claude":
-        return _is_anthropic_provider
-    if cli_agent == "codex":
-        return lambda p: not _is_anthropic_provider(p)
-    return None
+    # Imported lazily: model_compat lives under agent_teams.external, whose
+    # package __init__ eagerly imports tool_gateway -> team_workspace.tools.
+    # tool_member is itself imported while team_workspace.tools is still
+    # mid-initialization, so a top-level import would re-enter it and deadlock.
+    from openjiuwen.agent_teams.external.cli_agent.model_compat import provider_filter_for_cli
+
+    return provider_filter_for_cli(cli_agent)
+
+
+def _takes_auth_fallback(cli_agent: str) -> bool:
+    """Return whether ``cli_agent`` switches to a team model when its own login fails."""
+    from openjiuwen.agent_teams.external.cli_agent import backends
+
+    return backends.takes_auth_fallback(cli_agent)
 
 
 def _model_api_protocol(provider: str) -> str:
     """Return the external CLI protocol label for a model provider."""
-    return "Anthropic" if _is_anthropic_provider(provider) else "OpenAI"
+    from openjiuwen.agent_teams.external.cli_agent.model_compat import model_api_protocol
+
+    return model_api_protocol(provider)
 
 
 def _builtin_model_catalog(team: TeamBackend) -> str:
@@ -66,6 +98,39 @@ def _optional_text(value: Any) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def model_name_description(team: TeamBackend, t: Translator) -> str:
+    """Describe the ``model_name`` argument of a tool that registers a teammate.
+
+    Inside a model group the field takes a route tag rather than a pool
+    model, so the wording switches and the selectable tags are listed.
+    """
+    if not team.is_model_group_pool():
+        return t("spawn_teammate", "model_name")
+    catalog = {"selectable_models": [str(tag) for tag in team.list_route_tags()]}
+    context = f"<selectable_model_catalog>{json.dumps(catalog, ensure_ascii=False)}</selectable_model_catalog>"
+    return f"{t('spawn_teammate', 'model_name_group')}\n\n{context}"
+
+
+def check_model_selectable(team: TeamBackend, model_name: Any, allocation: "Allocation | None") -> str | None:
+    """Reject an explicit ``model_name`` the current model group cannot honour.
+
+    In a model group an explicit model is a hard requirement: running the
+    member on the whole group instead would silently ignore the user.
+
+    Returns:
+        An error message when the model is not selectable, otherwise ``None``.
+    """
+    model_name = _optional_text(model_name)
+    if allocation is not None or not model_name or not team.is_model_group_pool():
+        return None
+    selectable = ", ".join(team.list_route_tags()) or "<none>"
+    return (
+        f"model_name '{model_name}' is not selectable in the current model group "
+        f"(selectable: {selectable}). Do not pick a substitute yourself: ask the user "
+        "which model to use, or omit model_name to let the model group choose."
+    )
 
 
 # ========== Member Management ==========
@@ -110,25 +175,6 @@ class _SpawnToolBase(TeamTool, ABC):
         self.team = team
 
     @staticmethod
-    def _validate_member_name(member_name: str | None) -> str | None:
-        """Validate ``member_name`` at the tool boundary.
-
-        Returns:
-            An error message when the name is missing or malformed,
-            otherwise ``None``.
-        """
-        if member_name and _MEMBER_NAME_PATTERN.match(member_name):
-            return None
-        return (
-            f"Invalid member_name {member_name!r}: must start with a "
-            "lowercase ASCII letter (a-z), followed by lowercase letters, "
-            "digits (0-9) or hyphen (-); no uppercase, underscore, "
-            "whitespace, or non-ASCII characters (including CJK) — "
-            "member_name is reused as a routing token and a filesystem "
-            "path segment"
-        )
-
-    @staticmethod
     def _fail(reason: str) -> ToolOutput:
         """Build a failed ToolOutput carrying a diagnostic reason."""
         return ToolOutput(success=False, error=reason)
@@ -169,6 +215,46 @@ class _SpawnToolBase(TeamTool, ABC):
             f"Member spawned: member_name={d['member_name']} "
             f"display_name={d['display_name']} role={role}{suffix}"
         )
+
+
+async def register_teammate(
+    team: TeamBackend,
+    *,
+    member_name: str,
+    display_name: str,
+    desc: str,
+    prompt: str | None,
+    allocation: "Allocation | None",
+    isolation: str | None = None,
+    permissions_override: dict[str, str] | None = None,
+    lifetime: str | None = None,
+) -> "MemberOpResult":
+    """Register one ordinary LLM teammate row (UNSTARTED) — the single place that
+    knows how a teammate's card and mode are derived.
+
+    Used by ``spawn_teammate`` and by ``create_task``'s inline ``member``
+    (F_118), so the two can never drift on card id, mode or options.
+    """
+    from openjiuwen.agent_teams.schema.status import MemberMode
+    from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+
+    agent_card = AgentCard(
+        id=f"{team.team_name}_{member_name}",
+        name=display_name,
+        description=desc,
+    )
+    return await team.spawn_member(
+        member_name=member_name,
+        display_name=display_name,
+        agent_card=agent_card,
+        desc=desc,
+        prompt=prompt,
+        mode=MemberMode(team.teammate_mode.value),
+        allocation=allocation,
+        isolation=isolation,
+        permissions_override=permissions_override,
+        lifetime=lifetime,
+    )
 
 
 class SpawnTeammateTool(_SpawnToolBase):
@@ -226,7 +312,7 @@ class SpawnTeammateTool(_SpawnToolBase):
             "prompt": {"type": "string", "description": t("spawn_teammate", "prompt")},
             "model_name": {
                 "type": "string",
-                "description": t("spawn_teammate", "model_name"),
+                "description": model_name_description(team, t),
             },
             "isolation": {
                 "type": "string",
@@ -273,10 +359,7 @@ class SpawnTeammateTool(_SpawnToolBase):
         }
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
-        from openjiuwen.agent_teams.schema.status import MemberMode
-        from openjiuwen.core.single_agent.schema.agent_card import AgentCard
-
-        err = self._validate_member_name(inputs.get("member_name"))
+        err = validate_member_name(inputs.get("member_name"))
         if err:
             return self._fail(err)
 
@@ -297,25 +380,21 @@ class SpawnTeammateTool(_SpawnToolBase):
         member_name = inputs["member_name"]
         display_name = inputs.get("display_name")
         desc = inputs.get("desc", "")
-        permissions_override = inputs.get("permissions")
         allocation = (
             self._allocate_model_config(inputs.get("model_name")) if self._allocate_model_config else None
         )
-        agent_card = AgentCard(
-            id=f"{self.team.team_name}_{member_name}",
-            name=display_name,
-            description=desc,
-        )
-        result = await self.team.spawn_member(
+        err = check_model_selectable(self.team, inputs.get("model_name"), allocation)
+        if err:
+            return self._fail(err)
+        result = await register_teammate(
+            self.team,
             member_name=member_name,
             display_name=display_name,
-            agent_card=agent_card,
             desc=desc,
             prompt=inputs.get("prompt"),
-            mode=MemberMode(self.team.teammate_mode.value),
             allocation=allocation,
             isolation=inputs.get("isolation"),
-            permissions_override=permissions_override,
+            permissions_override=inputs.get("permissions"),
         )
         fork_value = inputs.get("fork")
         if fork_value and fork_value not in ("false", False):
@@ -486,7 +565,7 @@ class SpawnHumanAgentTool(_SpawnToolBase):
         }
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
-        err = self._validate_member_name(inputs.get("member_name"))
+        err = validate_member_name(inputs.get("member_name"))
         if err:
             return self._fail(err)
 
@@ -543,7 +622,10 @@ class SpawnPassiveHumanTool(_SpawnToolBase):
         }
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
-        err = self._validate_member_name(inputs.get("member_name"))
+        if getattr(self.team, "conversation_mode", "team") != "group_chat":
+            return self._fail("spawn_passive_human requires a group_chat runtime")
+
+        err = validate_member_name(inputs.get("member_name"))
         if err:
             return self._fail(err)
 
@@ -620,7 +702,7 @@ class SpawnBridgeAgentTool(_SpawnToolBase):
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
         from openjiuwen.agent_teams.schema.team import BridgeMailboxInjectMode
 
-        err = self._validate_member_name(inputs.get("member_name"))
+        err = validate_member_name(inputs.get("member_name"))
         if err:
             return self._fail(err)
 
@@ -732,7 +814,7 @@ class SpawnExternalCliTool(_SpawnToolBase):
                     "description": fallback_description,
                 },
             },
-            "required": ["member_name", "display_name", "prompt", "cli_agent", "fallback_model_name"],
+            "required": ["member_name", "display_name", "prompt", "cli_agent"],
         }
         # Built-in model choice is an attribute-level capability: the two
         # properties exist only when some declared CLI kind offers a catalog.
@@ -774,6 +856,11 @@ class SpawnExternalCliTool(_SpawnToolBase):
 
     def _preferred_current_model(self, cli_agent: str, entries: list["ModelPoolEntry"]) -> str | None:
         """Return the current model when the pool can allocate it compatibly."""
+        # In a model group the current model is the logical "*" entry, not a
+        # concrete model an external CLI can run; the fallback must be one of
+        # the real deployments instead.
+        if self.team.is_model_group_pool():
+            return None
         current_name = self.team.current_model_name
         current_provider = self.team.current_model_provider
         if current_name is None or current_provider is None:
@@ -789,13 +876,19 @@ class SpawnExternalCliTool(_SpawnToolBase):
     def _model_catalog_context(self) -> str:
         """Render safe current-model and pool protocol data for the model."""
         current_model = None
-        if self.team.current_model_name is not None and self.team.current_model_provider is not None:
+        if (
+            not self.team.is_model_group_pool()
+            and self.team.current_model_name is not None
+            and self.team.current_model_provider is not None
+        ):
             current_model = {
                 "model_name": self.team.current_model_name,
                 "protocol": _model_api_protocol(self.team.current_model_provider),
             }
         compatible_by_cli: dict[str, list[dict[str, str]]] = {}
         for cli_agent in sorted(self.team.external_cli_kinds()):
+            if not _takes_auth_fallback(cli_agent):
+                continue
             provider_filter = _provider_filter_for_cli(cli_agent)
             if self.team.is_model_group_pool():
                 options = {
@@ -819,7 +912,7 @@ class SpawnExternalCliTool(_SpawnToolBase):
         return f"<fallback_model_catalog>{json.dumps(catalog, ensure_ascii=False)}</fallback_model_catalog>"
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
-        err = self._validate_member_name(inputs.get("member_name"))
+        err = validate_member_name(inputs.get("member_name"))
         if err:
             return self._fail(err)
 
@@ -844,18 +937,14 @@ class SpawnExternalCliTool(_SpawnToolBase):
         member_name = inputs["member_name"]
         display_name = inputs.get("display_name")
         model_name = inputs.get("model_name")
-        if "fallback_model_name" not in inputs:
-            return self._fail("spawn_external_cli requires 'fallback_model_name' to be a model name or null")
-        raw_fallback_model_name = inputs["fallback_model_name"]
+        raw_fallback_model_name = inputs.get("fallback_model_name")
         if raw_fallback_model_name is not None and not isinstance(raw_fallback_model_name, str):
-            return self._fail("spawn_external_cli requires 'fallback_model_name' to be a model name or null")
-        fallback_model_name = (
-            raw_fallback_model_name.strip()
-            if isinstance(raw_fallback_model_name, str)
-            else None
-        )
-        if fallback_model_name == "":
-            return self._fail("spawn_external_cli requires 'fallback_model_name' to be a non-empty model name or null")
+            return self._fail("spawn_external_cli requires 'fallback_model_name' to be a model name when given")
+        # Omitted, null and blank all mean "no fallback model".
+        fallback_model_name = (raw_fallback_model_name or "").strip() or None
+        has_auth_fallback = _takes_auth_fallback(cli_agent)
+        if fallback_model_name is not None and not has_auth_fallback:
+            return self._fail(f"cli_agent '{cli_agent}' has no authentication fallback; omit 'fallback_model_name'")
         allocation = None
         fallback_allocation = None
         provider_filter = _provider_filter_for_cli(cli_agent)
@@ -898,9 +987,9 @@ class SpawnExternalCliTool(_SpawnToolBase):
                     )
                 )
         if fallback_model_name is None:
-            if compatible_model_names:
+            if compatible_model_names and has_auth_fallback:
                 return self._fail(
-                    "fallback_model_name cannot be null while compatible models are available for "
+                    "fallback_model_name is required while compatible models are available for "
                     f"cli_agent '{cli_agent}': {', '.join(compatible_model_names)}"
                 )
         elif preferred_current_model is not None and fallback_model_name != preferred_current_model:
@@ -933,8 +1022,8 @@ class SpawnExternalCliTool(_SpawnToolBase):
                 compatible_hint = ", ".join(compatible_model_names) if compatible_model_names else "none"
                 return self._fail(
                     f"fallback_model_name '{fallback_model_name}' is unavailable or incompatible with "
-                    f"cli_agent '{cli_agent}' (compatible models: {compatible_hint}); use null only when no "
-                    "compatible model is available"
+                    f"cli_agent '{cli_agent}' (compatible models: {compatible_hint}); omit 'fallback_model_name' "
+                    "only when no compatible model is available"
                 )
         result = await self.team.spawn_external_cli_agent(
             member_name=member_name,
@@ -1014,14 +1103,32 @@ class SpawnExternalCliTool(_SpawnToolBase):
 
 
 class ShutdownMemberTool(TeamTool):
-    """Shutdown a team member"""
+    """Shutdown a team member.
 
-    def __init__(self, team: TeamBackend, t: Translator):
+    The lifetime / DORMANT note is a gated capability slot: only the
+    scheduled variant of ``create_task`` can declare a member with a
+    ``lifetime``, so under autonomous dispatch the prose about it is dropped
+    (F_118 / B_04) — the model must never read about a path it cannot take.
+    """
+
+    #: Description slot documenting lifetime-driven terminal states.
+    _LIFETIME_SLOT = "shutdown_member_lifetime"
+
+    def __init__(self, team: TeamBackend, t: Translator, *, dispatch_mode: str = "autonomous"):
+        """Build the shutdown_member tool.
+
+        Args:
+            team: Backend the shutdown request goes through.
+            t: Locale-bound translator.
+            dispatch_mode: How tasks reach members. ``"scheduled"`` keeps the
+                lifetime note; ``"autonomous"`` omits it.
+        """
+        lifetime_enabled = dispatch_mode == "scheduled"
         super().__init__(
             ToolCard(
                 id="team.shutdown_member",
                 name="shutdown_member",
-                description=t("shutdown_member"),
+                description=t("shutdown_member", omit=None if lifetime_enabled else frozenset({self._LIFETIME_SLOT})),
             )
         )
         self.team = team

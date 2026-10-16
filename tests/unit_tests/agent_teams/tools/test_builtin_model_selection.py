@@ -90,7 +90,7 @@ def test_builtin_catalog_is_validated_on_the_spec() -> None:
         ExternalCliBuiltinModel(name="sonnet", efforts=["low"], default_effort="max")
     with pytest.raises(ValueError, match="unique"):
         _claude_spec(builtin_models=[ExternalCliBuiltinModel(name="a"), ExternalCliBuiltinModel(name="a")])
-    with pytest.raises(ValueError, match="builtin_models is only valid"):
+    with pytest.raises(ValueError, match="builtin_models is not valid for adapter-backed"):
         ExternalCliAgentSpec(cli_agent="gemini", builtin_models=[ExternalCliBuiltinModel(name="a")])
 
 

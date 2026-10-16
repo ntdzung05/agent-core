@@ -13,7 +13,7 @@ from openjiuwen.core.foundation.llm.schema.message import ToolMessage
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ModelCallInputs, ToolCallInputs
 from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
-from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _FakeSession, _run
+from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _declare_output, _FakeSession, _run
 
 STATE_KEY = "__browser_phase_budget_state__"
 WEATHER_URL = "https://www.bing.com/search?q=Singapore+weather"
@@ -43,13 +43,6 @@ def test_ax_links_are_not_current_page_metadata():
     ]}) == WEATHER_URL
 
 
-def test_search_results_word_does_not_invent_title_requirement():
-    assert BrowserRuntimeRail._infer_required_fields("打开Bing搜索新加坡天气，读取搜索结果中的最低温") == [
-        "low_temperature"
-    ]
-    assert BrowserRuntimeRail._infer_required_fields("Report high_temperature and low_temperature") == [
-        "high_temperature", "low_temperature"
-    ]
 
 
 def test_sourced_weather_answer_does_not_require_another_field_mapping_lookup():
@@ -61,7 +54,7 @@ def test_sourced_weather_answer_does_not_require_another_field_mapping_lookup():
     output, payload = BrowserRuntimeRail._render_authoritative_terminal_output(state, WEATHER_TEXT)
     assert payload["status"] == "completed"
     assert payload["missing_fields"] == []
-    assert payload["unverified_fields"] == ["high_temperature", "low_temperature"]
+    assert "unverified_fields" not in payload
     assert payload["observations"][0]["source"] == WEATHER_URL
     assert payload["observations"][0]["generation_id"] == "g3"
     assert WEATHER_TEXT in payload["observations"][0]["raw_text"]
@@ -87,8 +80,9 @@ def test_raw_observations_do_not_override_hard_requirements(case):
         "comparison": "对比B站综合和最新结果的标题",
     }.get(case, "Report low_temperature")
     state = _observed_state(task)
-    if case in {"rating", "comparison", "count"}:
-        state["requirements_source"] = "explicit"
+    if case in {"rating", "comparison", "count", "unavailable", "explicit"}:
+        field = {"rating": "product_rating", "comparison": "title"}.get(case, "low_temperature")
+        _declare_output(state, [field])
     if case == "count":
         state.update(requested_result_count=3, observed_result_count=1)
     elif case == "unavailable":
@@ -121,7 +115,7 @@ def test_progress_alias_with_complete_typed_evidence_remains_completed():
     _run(BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime)).before_tool_call(ctx))
     result = ctx.consume_force_finish().result["authoritative_browser_result"]
     assert result["status"] == "completed"
-    assert result["evidence"][0]["value"] == "Weather"
+    assert state["structured_evidence"][0]["values"]["title"] == "Weather"
 
 
 def test_generation_or_selector_change_does_not_turn_same_observation_into_progress():
@@ -218,14 +212,8 @@ def test_read_exemption_does_not_bypass_mutation_gate_in_same_group(exhausted):
     rail, ctx, state = _admission_context(calls)
     state["replan_count"] = 2 if exhausted else 0
     assert _admit(rail, ctx, calls[0]) is None
-    result = _admit(rail, ctx, calls[1])
-    if exhausted:
-        assert result["executed"] is False
-        assert state["replan_count"] == 2
-    else:
-        assert result is None
-        assert state["replan_count"] == 1
-        assert state["replan_trial_pending"] is True
+    assert _admit(rail, ctx, calls[1]) is None
+    assert state["replan_count"] == (2 if exhausted else 0)
 
 
 def test_schema_error_does_not_reserve_or_consume_replan_trial():

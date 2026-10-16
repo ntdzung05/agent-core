@@ -6,12 +6,23 @@ import json
 from collections.abc import Mapping as MappingABC
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import httpx
-
 from openjiuwen.core.common.exception.codes import StatusCode
-from openjiuwen.core.common.exception.errors import ModelError, build_error
+from openjiuwen.core.common.exception.errors import ModelError, ValidationError, build_error
 from openjiuwen.core.common.logging import LogEventType, llm_logger, logger
 from openjiuwen.core.common.security.ssl_utils import SslUtils
 from openjiuwen.core.common.security.url_utils import UrlUtils
@@ -54,6 +65,8 @@ from openjiuwen.core.foundation.llm.utils.provider_error import (
     format_provider_exception,
     summarize_provider_error_text,
 )
+from openjiuwen.core.foundation.llm.utils.request_encoding import create_encoding_aware_openai_client
+from openjiuwen.core.foundation.llm.utils.request_sanitizer import json_arguments, sanitize_chat_request
 from openjiuwen.core.foundation.llm.utils.responses_transport import OpenAIAccountResponsesTransport
 from openjiuwen.core.foundation.llm.utils.responses_utils import build_request_body
 from openjiuwen.core.foundation.tool import ToolInfo
@@ -658,7 +671,7 @@ class OpenAIModelClient(BaseModelClient):
                     "index": tc.get("index"),
                     "function": {
                         "name": func.get("name", ""),
-                        "arguments": func.get("arguments", ""),
+                        "arguments": json_arguments(func.get("arguments", "")),
                     },
                 })
             msg["tool_calls"] = cleaned
@@ -1063,7 +1076,7 @@ class OpenAIModelClient(BaseModelClient):
 
         self._apply_openrouter_profile(params)
 
-        return params
+        return sanitize_chat_request(params)
 
     def _apply_openrouter_profile(self, params: dict) -> None:
         if self._endpoint_profile_name() != "openrouter":
@@ -1429,8 +1442,6 @@ class OpenAIModelClient(BaseModelClient):
 
     def _build_async_openai_client(self, timeout: Optional[float] = None) -> "openai.AsyncOpenAI":
         """Build a fresh ``AsyncOpenAI`` client with its own httpx connection pool."""
-        from openai import AsyncOpenAI
-
         ssl_verify, ssl_cert = self.model_client_config.verify_ssl, self.model_client_config.ssl_cert
         verify = SslUtils.create_strict_ssl_context(ssl_cert) if ssl_verify else ssl_verify
 
@@ -1466,7 +1477,7 @@ class OpenAIModelClient(BaseModelClient):
             max_retries=0,
         )
 
-        return AsyncOpenAI(
+        return create_encoding_aware_openai_client(
             api_key=self._resolved_api_key(),
             base_url=_normalize_openai_base_url(self.model_client_config.api_base),
             http_client=http_client,
@@ -1991,6 +2002,8 @@ class OpenAIModelClient(BaseModelClient):
                 is_stream=False,
                 exception=_format_exception_detail(e)
             )
+            if isinstance(e, ValidationError) and getattr(e, "details", None) == {"stage": "request_encoding"}:
+                raise
             raise build_error(
                 StatusCode.MODEL_CALL_FAILED,
                 error_msg=f"openAI API async invoke error: {_format_exception_detail(e)}"
@@ -2206,6 +2219,8 @@ class OpenAIModelClient(BaseModelClient):
                 is_stream=True,
                 exception=error_detail
             )
+            if isinstance(e, ValidationError) and getattr(e, "details", None) == {"stage": "request_encoding"}:
+                raise
             raise build_error(
                 StatusCode.MODEL_CALL_FAILED,
                 error_msg=f"openAI API async stream error: {error_detail}"

@@ -19,7 +19,7 @@ import time
 import uuid
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Iterable, List, Literal, Optional, Tuple, Union, cast
 
 from pydantic import BaseModel, Field
 
@@ -274,6 +274,10 @@ class ReActAgentConfig(BaseModel):
     prompt_template: List[Dict] = Field(default_factory=list, description="Prompt template list")
 
     max_iterations: int = Field(default=5, description="Maximum iterations")
+    on_max_iterations: Literal["error", "final_answer", "return_observations"] = Field(
+        default="error",
+        description="Action on iteration exhaustion; final_answer makes one additional tool-free model call",
+    )
 
     llm_return_token_ids: bool = Field(
         default=False, description="Whether to request token IDs from LLM (for RL trajectory collection)"
@@ -802,6 +806,14 @@ class ReActAgent(BaseAgent):
             model_client_config=model_client_config,
         )
 
+    def get_llm(self) -> Model:
+        """Return the current model, initializing it lazily when needed.
+
+        Raises:
+            ValueError: If model_client_config is not configured.
+        """
+        return self._get_llm()
+
     def _get_llm(self) -> Model:
         """Get LLM instance (lazy initialization)
 
@@ -956,10 +968,10 @@ class ReActAgent(BaseAgent):
             queued, which also means no event was fired.
         """
         queue = ctx.steering_queue
-        if queue is None or queue.empty():
+        if queue is None or not ctx.has_pending_steering():
             return []
         previous_inputs = ctx.inputs
-        ctx.inputs = SteeringDrainInputs(pending=queue.qsize())
+        ctx.inputs = SteeringDrainInputs(pending=ctx.steering_pending_count())
         try:
             await ctx.fire(AgentCallbackEvent.BEFORE_STEERING_DRAIN)
             limit = ctx.inputs.limit
@@ -1167,6 +1179,10 @@ class ReActAgent(BaseAgent):
         context processors, truncation, and window mutators as the request
         path instead of assembling a second approximate window.
         """
+        # Enforce the finalization boundary after BEFORE_MODEL_CALL rails, which
+        # can otherwise reintroduce tools even when _call_model receives None.
+        if ctx.extra.get("_finalizing_max_iterations"):
+            ctx.inputs.tools = None
         usage_prompt_sections = tuple(self._context_usage_prompt_sections())
         final_system = [SystemMessage(content=self.prompt_builder.build())]
         await self._sync_prompt_attachments(ctx, ctx.context)
@@ -1197,6 +1213,8 @@ class ReActAgent(BaseAgent):
         # provider.  Rails and the usage report both consume these values.
         ctx.inputs.messages = context_window.get_messages()
         ctx.inputs.tools = context_window.get_tools()
+        if ctx.extra.get("_finalizing_max_iterations"):
+            ctx.inputs.tools = None
         return context_window, usage_prompt_sections
 
     def _context_usage_prompt_sections(self) -> list[tuple[ContextCategory, str, str]]:
@@ -1775,7 +1793,7 @@ class ReActAgent(BaseAgent):
                 ai_message = await llm.invoke(
                     model=self._config.model_name,
                     messages=ctx.inputs.messages,
-                    tools=ctx.inputs.tools or None,
+                    tools=cast(ModelCallInputs, ctx.inputs).tools or None,
                     **extra_kwargs,
                 )
             except Exception as exc:
@@ -1812,7 +1830,7 @@ class ReActAgent(BaseAgent):
             async for chunk in llm.stream(
                 model=self._config.model_name,
                 messages=ctx.inputs.messages,
-                tools=ctx.inputs.tools or None,
+                tools=cast(ModelCallInputs, ctx.inputs).tools or None,
                 **extra_kwargs,
             ):
                 if accumulated_chunk is None:
@@ -2297,9 +2315,14 @@ class ReActAgent(BaseAgent):
             parallel_tool_calls=self._config.parallel_tool_calls,
         )
 
+        tool_names = {call.id: call.name for call in tool_calls}
         for tool_result, tool_message in results:
             if tool_message is not None:
                 await context.add_messages(tool_message)
+                if cast(ReActAgentConfig, self._config).on_max_iterations != "error":
+                    observation = tool_message.model_dump(mode="json")
+                    observation["name"] = observation.get("name") or tool_names.get(tool_message.tool_call_id)
+                    ctx.extra.setdefault("_iteration_observations", []).append(observation)
 
         multimodal_message = self._build_multimodal_tool_results_message(tool_result for tool_result, _ in results)
         if multimodal_message is not None:
@@ -2862,6 +2885,10 @@ class ReActAgent(BaseAgent):
 
                 context = await self._init_context(session)
                 ctx.context = context
+                if cast(ReActAgentConfig, self._config).on_max_iterations != "error" and (
+                    interruption_state or resume_continuation
+                ):
+                    ctx.extra["_iteration_observations"] = self._iteration_observations_from_context(context)
                 context_ready_at = time.monotonic()
 
                 rendered_system_prompt = self._build_rendered_system_prompt(
@@ -3059,8 +3086,9 @@ class ReActAgent(BaseAgent):
                         if boundary_finish is not None:
                             invoke_inputs.result = boundary_finish.result
                         else:
-                            result = {"output": "Max iterations reached without completion", "result_type": "error"}
-                            invoke_inputs.result = result
+                            invoke_inputs.result = await self._finish_max_iterations(ctx, context, session)
+                            if cast(ReActAgentConfig, self._config).on_max_iterations == "final_answer":
+                                await self.context_engine.save_contexts(session)
 
             # after_invoke rails have fired; return result (possibly adapted by rails via ctx.extra)
             return ctx.extra.get("invoke_result", invoke_inputs.result)
@@ -3099,6 +3127,96 @@ class ReActAgent(BaseAgent):
             finally:
                 reset_usage_attribution(attribution_token)
                 reset_usage_invocation_id(invocation_token)
+
+    @staticmethod
+    def _iteration_observations_from_context(context: ModelContext) -> list[dict[str, Any]]:
+        """Recover persisted evidence from the current user turn, including HITL resumes."""
+        observations: list[dict[str, Any]] = []
+        tool_names: dict[str, str] = {}
+        for message in context.get_messages():
+            if isinstance(message, UserMessage):
+                metadata = message.metadata or {}
+                source = metadata.get(OPENJIUWEN_MESSAGE_SOURCE_KIND_METADATA)
+                if source in (None, "query"):
+                    observations.clear()
+                    tool_names.clear()
+            elif isinstance(message, AssistantMessage):
+                tool_names.update({call.id: call.name for call in message.tool_calls or []})
+            elif isinstance(message, ToolMessage):
+                observation = message.model_dump(mode="json")
+                observation["name"] = observation.get("name") or tool_names.get(message.tool_call_id)
+                observations.append(observation)
+        return observations
+
+    async def _finish_max_iterations(
+        self, ctx: AgentCallbackContext, context: ModelContext, session: Session
+    ) -> dict[str, Any]:
+        """Return an explicitly incomplete result, optionally with a final answer.
+
+        This is outside the tool loop: even a provider that ignores the tool-free
+        request cannot execute another tool. Cancellation still propagates through
+        invoke's normal abort/persistence path.
+        """
+        result = {
+            "output": "Max iterations reached without completion",
+            "result_type": "error",
+            "termination_reason": "max_iterations",
+            "iterations_used": int(ctx.extra.get("_react_iteration", 0)),
+            "truncated_by_max_iterations": True,
+        }
+        strategy = cast(ReActAgentConfig, self._config).on_max_iterations
+        if strategy == "error":
+            return result
+
+        observations = list(ctx.extra.get("_iteration_observations", []))
+        seen = {item.get("tool_call_id") for item in observations}
+        # Workflow/HITL replay can append ToolMessages outside _execute_tool_call.
+        for observation in self._iteration_observations_from_context(context):
+            if observation.get("tool_call_id") not in seen:
+                observations.append(observation)
+                seen.add(observation.get("tool_call_id"))
+        result["observations"] = observations
+        if strategy == "return_observations":
+            # Do not label partial tool evidence as a successful answer.
+            return result
+
+        await context.add_messages(
+            UserMessage(
+                content=(
+                    "The tool iteration limit has been reached. Do not call any more tools. "
+                    "Give a best-effort final answer using the evidence already collected. "
+                    "Clearly state any missing information or unfinished work."
+                ),
+                metadata={OPENJIUWEN_MESSAGE_SOURCE_KIND_METADATA: "iteration_limit"},
+            )
+        )
+        ctx.extra["_finalizing_max_iterations"] = True
+        try:
+            answer = await self._call_model(ctx, context, None)
+            finish = ctx.consume_force_finish()
+            if finish is not None:
+                return finish.result
+            if isinstance(answer, dict):
+                return answer
+            if ctx.consume_model_continue_request() or ctx.has_pending_steering():
+                result["finalization_error"] = "Finalization requires further model work or pending user input"
+            elif not isinstance(answer, AssistantMessage) or answer.tool_calls:
+                result["finalization_error"] = "Finalization did not produce a tool-free answer"
+            elif not answer.content or (isinstance(answer.content, str) and not answer.content.strip()):
+                result["finalization_error"] = "Finalization did not produce a tool-free answer"
+            else:
+                finish_reason = str(answer.finish_reason or "").strip().lower()
+                if finish_reason in {"length", "max_tokens", "content_filter", "error", "failed"}:
+                    result["finalization_error"] = f"Finalization did not complete: {finish_reason}"
+                else:
+                    await context.add_messages(answer)
+                    result.update(output=answer.content, result_type="answer")
+        except Exception as exc:
+            logger.warning("ReAct iteration-limit finalization failed: %s", exc)
+            result["finalization_error"] = str(exc)
+        finally:
+            ctx.extra.pop("_finalizing_max_iterations", None)
+        return result
 
     async def write_invoke_result_to_stream(
         self,

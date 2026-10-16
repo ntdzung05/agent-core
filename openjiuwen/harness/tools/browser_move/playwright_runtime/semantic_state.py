@@ -286,6 +286,8 @@ class SemanticStateTracker:
 
     def __init__(self, *, history_size: int = 16) -> None:
         self._history: deque[str] = deque(maxlen=max(4, int(history_size)))
+        self._metadata_history: deque[str] = deque(maxlen=max(4, int(history_size)))
+        self._last_content: tuple[str, str] | None = None
         self._filter_history: deque[str] = deque(maxlen=max(4, int(history_size)))
         self._last_state: Dict[str, Any] | None = None
         self._consecutive_no_progress = 0
@@ -326,22 +328,38 @@ class SemanticStateTracker:
         semantic_state = build_semantic_state(raw_state)
         self._field_coverage.update(semantic_state.get("field_coverage") or [])
         semantic_state["field_coverage"] = sorted(self._field_coverage)
-        previous_state = self._last_state or {}
+        previous_state = dict(self._last_state or {})
+        complete_content = bool(semantic_state.get("page_content_hash"))
+        if complete_content and self._last_content and self._last_content[0] == semantic_state.get("url"):
+            previous_state["page_content_hash"] = self._last_content[1]
+        elif not complete_content:
+            # A guarded JEV probe has no AX fingerprint. Its absence is not page progress.
+            previous_state.pop("page_content_hash", None)
+        comparison_state = semantic_state
+        content_baseline = bool(complete_content and self._history and not previous_state.get("page_content_hash"))
+        if content_baseline:
+            # Learning the first complete fingerprint is also not evidence of a content change.
+            comparison_state = {k: v for k, v in semantic_state.items() if k != "page_content_hash"}
         changed_fields = sorted(
             key
-            for key in set(previous_state) | set(semantic_state)
-            if previous_state.get(key) != semantic_state.get(key)
+            for key in set(previous_state) | set(comparison_state)
+            if previous_state.get(key) != comparison_state.get(key)
         )
-        state_digest = _digest(semantic_state)
+        state_digest = _digest(comparison_state)
         filter_digest = _digest(_filter_state(semantic_state))
-        previous_digest = self._history[-1] if self._history else ""
+        metadata_digest = _digest({k: v for k, v in semantic_state.items() if k != "page_content_hash"})
+        comparison_history = self._history if complete_content and not content_baseline else self._metadata_history
+        previous_digest = _digest(previous_state) if self._history else ""
         repeated_state = bool(previous_digest and state_digest == previous_digest)
-        state_revisit = bool(not repeated_state and state_digest in self._history)
+        state_revisit = bool(not repeated_state and state_digest in comparison_history)
         aba_loop = bool(
-            len(self._history) >= 2 and state_digest == self._history[-2] and state_digest != self._history[-1]
+            not repeated_state and len(comparison_history) >= 2
+            and state_digest == comparison_history[-2] and state_digest != comparison_history[-1]
         )
         repeated_filter_state = bool(
-            self._filter_history and filter_digest in self._filter_history and filter_digest != self._filter_history[-1]
+            previous_state.get("url") == semantic_state.get("url")
+            and self._filter_history and filter_digest in self._filter_history
+            and filter_digest != self._filter_history[-1]
         )
 
         # Reused filters can reveal new results; complete content takes precedence.
@@ -355,7 +373,9 @@ class SemanticStateTracker:
         elif repeated_state:
             progress = "no_progress"
             self._consecutive_no_progress += 1
-        elif revisit_detected:
+        elif revisit_detected and not (
+            set(semantic_state.get("field_coverage", [])) - set(previous_state.get("field_coverage", []))
+        ):
             progress = "state_revisit"
             self._consecutive_no_progress += 1
             self._state_revisit_count += 1
@@ -366,9 +386,17 @@ class SemanticStateTracker:
 
         # Repeated reads must not evict the states used to detect action loops.
         if progress != "inspection":
-            self._history.append(state_digest)
+            self._history.append(_digest(semantic_state))
+            self._metadata_history.append(metadata_digest)
             self._filter_history.append(filter_digest)
+        elif content_baseline:
+            for index in range(len(self._metadata_history) - 1, -1, -1):
+                if self._metadata_history[index] == metadata_digest:
+                    self._history[index] = _digest(semantic_state)
+                    break
         self._last_state = semantic_state
+        if complete_content:
+            self._last_content = (semantic_state.get("url", ""), semantic_state["page_content_hash"])
         self._revision += 1
 
         reasons: list[str] = []
@@ -402,6 +430,8 @@ class SemanticStateTracker:
     def reset(self) -> None:
         """Clear task-local semantic history."""
         self._history.clear()
+        self._metadata_history.clear()
+        self._last_content = None
         self._filter_history.clear()
         self._last_state = None
         self._consecutive_no_progress = 0

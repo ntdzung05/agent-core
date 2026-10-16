@@ -72,6 +72,7 @@ from openjiuwen.agent_teams.worktree.session_cleanup import remove_session_workt
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
+from openjiuwen.core.common.run_context import RunContext
 from openjiuwen.core.session.agent_team import (
     Session as AgentTeamSession,
 )
@@ -181,7 +182,7 @@ class TeamRuntimeManager:
             if selection_changed:
                 change_reason = "pool" if live_pool_signature != requested_pool_signature else "strategy"
                 team_logger.info(
-                    "activate: model %s changed for paused team {}; rebuilding runtime",
+                    "activate: model {} changed for paused team {}; rebuilding runtime",
                     change_reason,
                     team_name,
                 )
@@ -380,6 +381,7 @@ class TeamRuntimeManager:
             MemberStatus.STOPPED,
             MemberStatus.PAUSED,
             MemberStatus.SHUTDOWN,
+            MemberStatus.DORMANT,
             MemberStatus.ERROR,
         }
     )
@@ -394,7 +396,8 @@ class TeamRuntimeManager:
 
         Persisted ``team_member`` status is owned here for the natural
         round-end path:
-          - SHUTDOWN_REQUESTED -> stop + mark SHUTDOWN.
+          - SHUTDOWN_REQUESTED -> stop + mark the retire target (SHUTDOWN, or
+            DORMANT when the member's lifetime policy says so, F_118).
           - otherwise -> pause + mark READY (next assignment can pick it up).
 
         When ``team_member`` is already in
@@ -406,6 +409,27 @@ class TeamRuntimeManager:
         member = agent.team_member
         member_name = getattr(agent, "member_name", "?")
         try:
+            async def _release_member_kvc() -> None:
+                harness = getattr(getattr(agent, "resources", None), "harness", None)
+                current_session = getattr(harness, "current_session", None)
+                session = current_session() if callable(current_session) else None
+                release_kvc = getattr(session, "release_kvc", None)
+                if callable(release_kvc):
+                    await release_kvc()
+
+            # A member that retired itself (``shutdown_self``) says so in
+            # memory. Trust that over the row: a wake may already have CAS'd
+            # the row to RESTARTING, and reading that here would pause and
+            # re-mark READY a runtime that must be torn down (F_118).
+            retired = getattr(agent, "retired_status", None)
+            if retired is not None:
+                team_logger.info(
+                    "finalize_member: team member {} retired itself ({}); closing kernel only",
+                    member_name,
+                    retired.value,
+                )
+                await agent.stop_coordination(on_quiesced=_release_member_kvc)
+                return
             current_status: Optional[MemberStatus] = None
             if member is not None:
                 try:
@@ -419,14 +443,6 @@ class TeamRuntimeManager:
                 current_status is not None and current_status in TeamRuntimeManager._MEMBER_FINALIZED_STATUSES
             )
 
-            async def _release_member_kvc() -> None:
-                harness = getattr(getattr(agent, "resources", None), "harness", None)
-                current_session = getattr(harness, "current_session", None)
-                session = current_session() if callable(current_session) else None
-                release_kvc = getattr(session, "release_kvc", None)
-                if callable(release_kvc):
-                    await release_kvc()
-
             if already_finalized:
                 # Another lifecycle owner already wrote the persisted outcome.
                 # Just close the kernel without erasing STOPPED/PAUSED/ERROR.
@@ -435,19 +451,21 @@ class TeamRuntimeManager:
                     member_name,
                     current_status.value if current_status is not None else None,
                 )
-                if current_status is MemberStatus.SHUTDOWN:
+                if current_status in (MemberStatus.SHUTDOWN, MemberStatus.DORMANT):
                     await agent.stop_coordination(on_quiesced=_release_member_kvc)
                 else:
                     await agent.stop_coordination()
                 return
             if current_status == MemberStatus.SHUTDOWN_REQUESTED:
+                target = await agent.resolve_retire_target()
                 team_logger.info(
-                    "finalize_member: shutting down team member {} on request",
+                    "finalize_member: retiring team member {} on request -> {}",
                     member_name,
+                    target.value,
                 )
                 await agent.stop_coordination(on_quiesced=_release_member_kvc)
                 if member is not None:
-                    await member.update_status(MemberStatus.SHUTDOWN)
+                    await member.update_status(target)
                 return
             team_logger.info(
                 "finalize_member: pausing team member {}; marking READY for next assignment",
@@ -494,6 +512,7 @@ class TeamRuntimeManager:
         *,
         team_name: str,
         session_id: str,
+        run_context: RunContext | None = None,
     ) -> DeliverResult:
         """Route an interact payload through the active team's gate.
 
@@ -540,7 +559,10 @@ class TeamRuntimeManager:
 
         if isinstance(payload, InteractiveInput):
             if entry.agent.has_pending_interrupt():
-                await entry.agent.resume_interrupt(payload)
+                await entry.agent.resume_interrupt(
+                    payload,
+                    run_context=run_context,
+                )
                 return DeliverResult.success(None)
             return DeliverResult.failure("unsupported_interactive_input")
 
@@ -587,7 +609,12 @@ class TeamRuntimeManager:
             # routing directives — they fold back into a no-mention
             # message for the leader / avatar instead of silently
             # writing a bus message to a non-existent member.
-            return await self.dispatch_payloads(entry.agent, payloads, entry=entry)
+            return await self.dispatch_payloads(
+                entry.agent,
+                payloads,
+                entry=entry,
+                run_context=run_context,
+            )
         finally:
             await entry.interact_gate.consume_done(ticket)
 
@@ -674,13 +701,19 @@ class TeamRuntimeManager:
         payloads: list[InteractPayload],
         *,
         entry: Optional["ActiveTeam"] = None,
+        run_context: RunContext | None = None,
     ) -> DeliverResult:
         """Resolve and dispatch interact payloads through the runtime router."""
         payloads = await TeamRuntimeManager._resolve_recipients(agent, payloads)
 
         last_result: DeliverResult = DeliverResult.success(None)
         for entry_payload in payloads:
-            last_result = await TeamRuntimeManager._dispatch_payload(agent, entry_payload, entry=entry)
+            last_result = await TeamRuntimeManager._dispatch_payload(
+                agent,
+                entry_payload,
+                entry=entry,
+                run_context=run_context,
+            )
             if not last_result.ok:
                 return last_result
         return last_result
@@ -713,6 +746,7 @@ class TeamRuntimeManager:
         payload: InteractPayload,
         *,
         entry: Optional["ActiveTeam"] = None,
+        run_context: RunContext | None = None,
     ) -> DeliverResult:
         backend = agent.team_backend
         if backend is None and not isinstance(payload, GodViewMessage):
@@ -730,7 +764,11 @@ class TeamRuntimeManager:
             # decisions (``@<member>`` / ``# body`` / ``$<avatar>``)
             # live in ``parse_interact_str`` on the str-input boundary
             # and surface as concrete payload types of their own.
-            return await UserInbox.deliver_to_leader(agent.deliver_input, payload.body)
+            async def _deliver_to_leader(body: str) -> None:
+                """Deliver one input with its invocation-scoped context."""
+                await agent.deliver_input(body, run_context=run_context)
+
+            return await UserInbox.deliver_to_leader(_deliver_to_leader, payload.body)
         if isinstance(payload, OperatorMessage):
             inbox = UserInbox(backend.message_manager)
             if payload.target is None:

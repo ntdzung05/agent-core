@@ -546,8 +546,8 @@ def test_processor_guidance_defines_each_working_memory_field() -> None:
     processor = BrowserWorkingContextProcessor(BrowserWorkingContextProcessorConfig(language="en"))
     prompt = _inject(processor, _FakeContext(_FakeSession())).context_messages[-1].content
 
-    assert "Runtime-owned execution context" in prompt
-    assert "Inferred fields are extraction hints, not extra user requirements" in prompt
+    assert "Shared execution context" in prompt
+    assert "Business completion is your judgment" in prompt
     assert "do not echo this context" in prompt
     assert '"runtime_directive":"continue"' in prompt
     assert '"request":{"kind":"initial"' in prompt
@@ -567,8 +567,8 @@ def test_processor_renders_chinese_guidance_with_stable_schema_keys() -> None:
 
     prompt = _inject(processor, context).context_messages[-1].content
 
-    assert "这是 runtime 维护的执行上下文" in prompt
-    assert "推断字段是提取提示，不是额外用户要求" in prompt
+    assert "这是共享执行上下文" in prompt
+    assert "业务完成由你结合原始用户目标判断" in prompt
     assert "不要复述上下文" in prompt
     assert BROWSER_WORKING_MEMORY_RECORD_BEGIN not in prompt
     assert BROWSER_WORKING_MEMORY_RECORD_END not in prompt
@@ -588,6 +588,7 @@ def test_working_context_is_valid_json_within_configured_limit() -> None:
                 "task_id": "bounded-task",
                 "goal": "g" * 2_000,
                 "status": "in_progress",
+                "requirements_source": "explicit",
                 "required_evidence_slots": [
                     {"entity": f"entity-{index}", "variant": "default", "field": f"field-{index}"}
                     for index in range(20)
@@ -704,7 +705,7 @@ def test_follow_up_and_new_agent_instance_reuse_completed_session_memory() -> No
     )
     assert "Now check its tracking link" in prompt
     assert "Order 123 is shipped." in prompt
-    assert "Runtime-owned" in prompt
+    assert "Shared execution context" in prompt
 
 
 def test_inner_model_boundary_restores_and_reconciles_follow_up_when_outer_session_is_absent() -> None:
@@ -959,6 +960,7 @@ def test_processor_runtime_projection_ignores_legacy_model_memory() -> None:
                 "task_id": "task-runtime",
                 "goal": "Return the current page title",
                 "status": "in_progress",
+                "requirements_source": "explicit",
                 "required_fields": ["title"],
                 "field_coverage": [],
                 "structured_evidence": [],
@@ -999,6 +1001,7 @@ def test_processor_projects_runtime_task_state_before_current_page_state() -> No
                         "completion_condition": "requested fields have evidence",
                     }
                 },
+                "requirements_source": "explicit",
                 "required_fields": ["title", "price"],
                 "field_coverage": ["title"],
                 "blockers": [],
@@ -1034,7 +1037,7 @@ def test_processor_projects_runtime_task_state_before_current_page_state() -> No
 
     assert rendered.context_messages[-1] is current_state
     prompt = rendered.context_messages[-2].content
-    assert '"runtime_directive":"replan_before_browser_action"' in prompt
+    assert '"runtime_directive":"consider_different_strategy"' in prompt
     assert '"requirements":{' in prompt
     assert '"field":"price"' in prompt
     assert '"semantic_delta":"no_progress"' in prompt
@@ -1072,7 +1075,7 @@ def test_read_observation_preserves_active_interaction_replan(pending: bool, pro
     updated = session.get_state(BROWSER_TASK_STATE_KEY)
     assert {key: updated[key] for key in preserved} == preserved
     assert updated["semantic_progress"]["observation_only"] is True
-    assert BrowserWorkingContextStore._project_task_state(updated)["semantic_progress"]["observation_only"] is True
+    assert BrowserWorkingContextStore.project_task_state(updated)["semantic_progress"]["observation_only"] is True
 
 
 def test_new_evidence_from_read_observation_can_recover_pending_trial() -> None:
@@ -1092,7 +1095,7 @@ def test_new_evidence_from_read_observation_can_recover_pending_trial() -> None:
     updated = session.get_state(BROWSER_TASK_STATE_KEY)
     assert updated["replan_required"] is False
     assert updated["replan_trial_pending"] is False
-    assert updated["replan_count"] == 1
+    assert updated["replan_count"] == 0
 
 
 def test_semantic_observation_closes_sort_evidence_before_replan_gate() -> None:
@@ -1112,6 +1115,7 @@ def test_semantic_observation_closes_sort_evidence_before_replan_gate() -> None:
                     },
                     "extraction": {"status": "pending", "attempts": 0, "budget": 20},
                 },
+                "requirements_source": "explicit",
                 "required_fields": ["sort_state", "title"],
                 "required_evidence_slots": [
                     {"entity": "product", "variant": "default", "field": "sort_state"}
@@ -1169,6 +1173,7 @@ def test_changed_first_result_confirms_successful_sort_click() -> None:
                 "task_id": "sort-fallback",
                 "goal": "按销量排序",
                 "status": "in_progress",
+                "requirements_source": "explicit",
                 "required_fields": ["sort_state"],
                 "field_coverage": [],
                 "structured_evidence": [],
@@ -1299,7 +1304,7 @@ def test_content_only_progress_does_not_prove_action_success_or_task_evidence(
     assert state["structured_evidence"] == []
     assert state["evidence_slots"] == []
     assert state["status"] == "in_progress"
-    assert recovered is replan_pending
+    assert recovered is True
 
 
 @pytest.mark.parametrize("outcome_status", ["ambiguous", "success"])
@@ -1310,10 +1315,10 @@ def test_first_complete_capture_after_failure_cannot_verify_action_or_complete_p
     runtime._selector_primary_links = {}
     runtime._last_observed_url = ""
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._call_playwright_tool = AsyncMock(
+    runtime.call_playwright_tool = AsyncMock(
         side_effect=[RuntimeError("initial snapshot timeout"), '- article "Existing tender" [ref=e1]']
     )
-    runtime._call_playwright_run_code_unsafe = AsyncMock(
+    runtime.call_playwright_run_code_unsafe = AsyncMock(
         return_value={
             "ok": True,
             "url": "https://tenders.example/results",
@@ -1344,7 +1349,7 @@ def test_first_complete_capture_after_failure_cannot_verify_action_or_complete_p
     progress = captured["semantic_progress"]
     assert progress["progress"] == "initial"
     assert {"url", "result_count", "first_result_text", "page_content_hash"} <= set(progress["changed_fields"])
-    assert BrowserWorkingContextStore.sync_semantic_progress(session, progress) is False
+    assert BrowserWorkingContextStore.sync_semantic_progress(session, progress) is True
 
     state = session.get_state(BROWSER_TASK_STATE_KEY)
     assert state["recent_actions"][-1]["outcome_status"] == outcome_status

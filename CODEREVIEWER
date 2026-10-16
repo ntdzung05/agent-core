@@ -78,7 +78,7 @@ openjiuwen/symphony/observation/ duhaowei
 openjiuwen/harness/rails/security/tool_security_rail.py duhaowei
 examples/permissions/permission_demo.py duhaowei
 openjiuwen/rsi/harness_rsi/auto_harness/tools/ gaozhiting
-openjiuwen/rsi/harness_rsi/evaluator/runtime_adapters.py（第40—56行） gaozhiting
+openjiuwen/rsi/harness_rsi/evaluator/runtime_adapters.py gaozhiting,huanghongyun
 openjiuwen/harness/rails/evolution/approval_events.py gaozhiting
 openjiuwen/harness/rails/evolution/approval_runtime.py gaozhiting
 openjiuwen/harness/rails/evolution/evolution_interrupt_rail.py gaozhiting
@@ -96,7 +96,7 @@ openjiuwen/harness/tools/ask_user.py huanghao
 openjiuwen/agent_teams/spawn/ huanghao
 openjiuwen/agent_teams/tools/member_options.py huanghao
 openjiuwen/agent_teams/tools/tool_team.py huanghao
-openjiuwen/agent_teams/tools/tool_member.py（第1—336、411—412、459—1077、1126—1127、1180—1211行） huanghao
+openjiuwen/agent_teams/tools/tool_member.py huanghao,weichenhao
 openjiuwen/agent_teams/runtime/background_task_controller.py huanghao
 openjiuwen/agent_teams/tools/task_manager.py huanghao
 openjiuwen/agent_teams/tools/tool_async.py huanghao
@@ -109,7 +109,6 @@ openjiuwen/agent_teams/tools/tool_message.py huanghao
 openjiuwen/agent_teams/fork.py huanghao
 openjiuwen/agent_teams/fork_compact.py huanghao
 openjiuwen/agent_teams/harness/checkpoint.py huanghao
-openjiuwen/agent_teams/tools/tool_member.py（第337—410、413—458行） huanghao
 openjiuwen/agent_teams/team_workspace/__init__.py huanghao
 openjiuwen/agent_teams/team_workspace/assembler.py huanghao
 openjiuwen/agent_teams/team_workspace/binder.py huanghao
@@ -216,14 +215,12 @@ openjiuwen/rsi/usage.py huanghongyun
 scripts/rsi/ huanghongyun
 examples/MANGO/human_eval/execution.py huanghongyun
 examples/MANGO/textgrad/optimizer/optimizer.py huanghongyun
-openjiuwen/rsi/harness_rsi/evaluator/runtime_adapters.py（第59—118行） huanghongyun
 openjiuwen/harness/rails/subagent/verification_contract_rail.py huanghongyun
 openjiuwen/harness/rails/subagent/verification_rail.py huanghongyun
 openjiuwen/rsi/harness_rsi/auto_harness/rails/context_rail.py huanghongyun
 openjiuwen/rsi/harness_rsi/auto_harness/rails/experience_rail.py huanghongyun
 openjiuwen/rsi/harness_rsi/evaluator/controlled_skill_treatment_rail.py huanghongyun
 openjiuwen/rsi/harness_rsi/member_optimizer/agents/rails/harness_structure_rail.py huanghongyun
-openjiuwen/rsi/harness_rsi/evaluator/runtime_adapters.py（第1—39、57—58、119—427行） huanghongyun
 openjiuwen/core/single_agent/rail/__init__.py huanghongyun
 openjiuwen/core/single_agent/rail/base.py huanghongyun
 openjiuwen/core/kv_cache/ liangfuqi
@@ -435,8 +432,7 @@ openjiuwen/harness/goal/ lizhiyuan
 openjiuwen/harness/tools/goal.py lizhiyuan
 examples/MANGO/token_usage.py lizhiyuan
 openjiuwen/harness/tools/todo.py lizhiyuan
-openjiuwen/harness/tools/agent_mode_tools.py（第205—265行） lizhiyuan
-openjiuwen/harness/tools/agent_mode_tools.py（第1—204、266—395行） lizhiyuan
+openjiuwen/harness/tools/agent_mode_tools.py lizhiyuan
 openjiuwen/harness/rails/model_anomaly_detection_rail.py lizhiyuan
 openjiuwen/harness/rails/agent_mode_rail.py lizhiyuan
 openjiuwen/core/single_agent/rail/model_backup.py lizhiyuan
@@ -467,12 +463,11 @@ openjiuwen/agent_teams/workflow/runner.py wangcan
 openjiuwen/agent_teams/workflow/schema.py wangcan
 openjiuwen/agent_teams/workflow/tool_swarmflow.py wangcan
 openjiuwen/agent_teams/workflow/worktree.py wangcan
-openjiuwen/agent_teams/tools/structured_output_tool.py（第1—96、133—135行） wangcan
+openjiuwen/agent_teams/tools/structured_output_tool.py wangcan
 openjiuwen/harness/rails/interrupt/ask_user_rail.py wangcan
 openjiuwen/harness/rails/interrupt/confirm_rail.py wangcan
 openjiuwen/agent_teams/harness/snapshot_rail.py wangcan
 openjiuwen/agent_teams/workflow/backends/budget_rail.py wangcan
-openjiuwen/agent_teams/tools/structured_output_tool.py（第97—132行） wangcan
 openjiuwen/agent_teams/monitor/ wangcan
 openjiuwen/agent_teams/observability/ wangcan
 openjiuwen/extensions/observability/ wangcan
@@ -564,7 +559,6 @@ openjiuwen/harness/tools/worktree/session.py weichenhao
 openjiuwen/harness/tools/worktree/slug.py weichenhao
 openjiuwen/harness/tools/worktree/tools.py weichenhao
 openjiuwen/agent_teams/tools/tool_permissions.py weichenhao
-openjiuwen/agent_teams/tools/tool_member.py（第1078—1125、1128—1179行） weichenhao
 openjiuwen/harness/tools/worktree/rails.py weichenhao
 openjiuwen/agent_teams/prompts/team_plan_agent.py weichenhao
 openjiuwen/agent_teams/prompts/team_plan_mode.py weichenhao

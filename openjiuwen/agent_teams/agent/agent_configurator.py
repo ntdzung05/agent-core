@@ -30,7 +30,12 @@ from openjiuwen.agent_teams.paths import (
 from openjiuwen.agent_teams.paths import team_workspace_dir
 from openjiuwen.agent_teams.runtime.team_plan import is_team_plan_enabled
 from openjiuwen.agent_teams.schema.blueprint import TeamAgentSpec
-from openjiuwen.agent_teams.schema.deep_agent_spec import RailSpec, SysOperationSpec, WorkspaceSpec
+from openjiuwen.agent_teams.schema.deep_agent_spec import (
+    ProgressiveToolSpec,
+    RailSpec,
+    SysOperationSpec,
+    WorkspaceSpec,
+)
 from openjiuwen.agent_teams.schema.team import (
     TeamMemberSpec,
     TeamRole,
@@ -185,6 +190,33 @@ class _SwarmflowModelResolver:
         if self._spec is None:
             return []
         return [e.model_name for e in (self._spec.model_pool or [])]
+
+
+def _derive_swarmflow_worker_base_spec(
+    spec: TeamAgentSpec,
+    observability_rail_specs: list[Any],
+) -> Any:
+    """Worker base = teammate spec (leader fallback) + observability rails.
+
+    Workers are "a teammate without team tools": the raw agents[...] spec
+    carries teammate capabilities but not the team rails (those are injected
+    per member), so a worker built from it has no team tools by construction.
+    ``progressive_tool`` is only written when the team opts in, so a team that
+    leaves it off keeps the base spec exactly as configured.
+    """
+    base = spec.agents.get("teammate") or spec.agents.get("leader")
+    if base is None:
+        return None
+    update: dict[str, Any] = {"rails": list(base.rails or []) + observability_rail_specs}
+    if spec.progressive_tool:
+        update["progressive_tool"] = ProgressiveToolSpec(enabled=True)
+    return base.model_copy(update=update)
+
+
+def _derive_swarmflow_external_cli_agents(spec: TeamAgentSpec) -> tuple[Any, ...]:
+    """The swarmflow third-party allowlist lives on the blueprint spec only —
+    the runtime ``TeamSpec`` never carries ``external_cli_agents``."""
+    return tuple(spec.external_cli_agents)
 
 
 class AgentConfigurator:
@@ -635,14 +667,13 @@ class AgentConfigurator:
         # team config (predefined roster, plan-mode, reliability gating) stay
         # here; "can it build" gates (a missing handle) live in the factories.
         from openjiuwen.agent_teams.rails.elements import (
-            OBSERVABILITY,
-            TEAM_OBSERVABILITY,
             TEAM_PLAN_MODE,
             TEAM_POLICY,
             TEAM_RELIABILITY,
             TEAM_TOOL,
             TEAM_TOOL_APPROVAL,
             TEAM_WORKSPACE,
+            observability_rail_specs,
         )
         from openjiuwen.agent_teams.rails.registration import (
             ensure_harness_elements_registered,
@@ -653,14 +684,12 @@ class AgentConfigurator:
         ensure_harness_elements_registered()
 
         # Observability rail specs — shared by all agents (members + swarmflow
-        # workers). Two rails, always mounted as a pair: ``core.observability``
-        # owns the agent span itself (harness-level, team-agnostic) and
-        # ``core.team.observability`` layers the team identity onto it. Each
-        # provider checks is_initialized() — no-op when disabled.
-        observability_rail_specs = [
-            RailSpec(type=TEAM_OBSERVABILITY),
-            RailSpec(type=OBSERVABILITY),
-        ]
+        # workers + scheduled-mode temp reviewers). Two rails, always mounted
+        # as a pair: ``core.observability`` owns the agent span itself
+        # (harness-level, team-agnostic) and ``core.team.observability`` layers
+        # the team identity onto it. Each provider checks is_initialized() —
+        # no-op when disabled.
+        member_observability_rail_specs = observability_rail_specs()
 
         # Predefined teams pin their roster — strip every dynamic spawn tool
         # (one per role_type) from the leader's tool set.
@@ -676,6 +705,7 @@ class AgentConfigurator:
                 params={
                     "teammate_mode": teammate_mode,
                     "dispatch_mode": spec.dispatch_mode,
+                    "bootstrap_mode": spec.bootstrap_mode,
                     "lifecycle": spec.lifecycle,
                     "team_mode": _resolve_team_mode(spec),
                     "exclude_tools": exclude,
@@ -696,6 +726,7 @@ class AgentConfigurator:
                     "teammate_mode": teammate_mode,
                     "team_mode": _resolve_team_mode(spec),
                     "dispatch_mode": spec.dispatch_mode,
+                    "bootstrap_mode": spec.bootstrap_mode,
                     "base_prompt": agent_spec.system_prompt,
                     "team_workspace_path": team_workspace_path,
                     "team_outputs_dir": team_outputs_dir,
@@ -805,6 +836,8 @@ class AgentConfigurator:
         swarmflow_human_base_spec = None
         swarmflow_concurrency_governor = None
         swarmflow_budget = None
+        swarmflow_external_cli_agents: tuple[Any, ...] = ()
+        swarmflow_expert_specs: dict[str, Any] = {}
         if ctx.role == TeamRole.LEADER and spec.enable_swarmflow:
             # Callable class (same call contract as the historical closure) so
             # the inject chain stays unchanged, plus pool_names for the
@@ -814,25 +847,21 @@ class AgentConfigurator:
             # and the shrunk-pool window behind the engine's pre-flight.
             swarmflow_model_resolver = _SwarmflowModelResolver(ctx.team_spec)
 
-            # Workers are "a teammate without team tools": derive each worker from
-            # the team's teammate spec (or the leader spec when no teammate exists).
-            # The raw agents[...] spec carries teammate capabilities but NOT the
-            # team rails (those are injected here, per member), so a worker built
-            # straight from it has no team tools by construction.
             base_specs = spec.agents
-            swarmflow_worker_base_spec = base_specs.get("teammate") or base_specs.get("leader")
+            swarmflow_worker_base_spec = _derive_swarmflow_worker_base_spec(spec, member_observability_rail_specs)
             # Human-session avatars derive from the human_agent spec; fall back to
-            # the worker base spec so human_session still works when no dedicated
+            # the raw worker base so human_session still works when no dedicated
             # human_agent spec is configured (it just lacks human-tuned desc).
-            swarmflow_human_base_spec = base_specs.get("human_agent") or swarmflow_worker_base_spec
-
-            # Workers also need the observability rail for agent spans.
-            if swarmflow_worker_base_spec is not None:
-                swarmflow_worker_base_spec = swarmflow_worker_base_spec.model_copy(
-                    update={
-                        "rails": list(swarmflow_worker_base_spec.rails or []) + observability_rail_specs,
-                    },
+            # Like the worker base, it mounts the observability rail pair so
+            # the avatar's records carry an agent span in the trajectory.
+            human_base = base_specs.get("human_agent") or base_specs.get("teammate") or base_specs.get("leader")
+            swarmflow_human_base_spec = (
+                human_base.model_copy(
+                    update={"rails": list(human_base.rails or []) + member_observability_rail_specs},
                 )
+                if human_base is not None
+                else None
+            )
 
             from openjiuwen.agent_teams.workflow.concurrency import (
                 ConcurrencyGovernor,
@@ -851,6 +880,14 @@ class AgentConfigurator:
             # governor's L3): concurrent runs draw down one pool. ``total=None``
             # keeps it unbounded while still giving scripts a live ``spent()``.
             swarmflow_budget = BudgetLedger(total=spec.swarmflow_budget)
+            swarmflow_external_cli_agents = _derive_swarmflow_external_cli_agents(spec)
+
+            from openjiuwen.agent_teams.workflow.backends.expert_specs import derive_swarmflow_expert_specs
+
+            # Experts are AgentGroup members already in the blueprint; a script
+            # picks one by member name. Derived once here, next to the worker
+            # base spec, so both ride the same rails and progressive_tool switch.
+            swarmflow_expert_specs = derive_swarmflow_expert_specs(spec, member_observability_rail_specs)
 
         inject_team_handles(
             member_build_context.extras,
@@ -863,6 +900,8 @@ class AgentConfigurator:
             swarmflow_human_base_spec=swarmflow_human_base_spec,
             swarmflow_concurrency_governor=swarmflow_concurrency_governor,
             swarmflow_budget=swarmflow_budget,
+            swarmflow_external_cli_agents=swarmflow_external_cli_agents,
+            swarmflow_expert_specs=swarmflow_expert_specs,
             reliability_components=reliability_components,
             permissions_override=ctx.permissions_override,
             worktree_manager=self.worktree_manager,
@@ -870,7 +909,7 @@ class AgentConfigurator:
 
         # Fold the team rails into the spec rails (after the user rails, to keep
         # the init order consistent with the legacy mount order).
-        team_rail_specs.extend(observability_rail_specs)
+        team_rail_specs.extend(member_observability_rail_specs)
         base_rails = _apply_team_worktree_shell_guard(
             list(build_spec.rails or []),
             enabled=ctx.role in {TeamRole.LEADER, TeamRole.TEAMMATE, TeamRole.EXTERNAL_CLI},

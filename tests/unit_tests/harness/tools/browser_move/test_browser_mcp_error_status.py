@@ -11,6 +11,7 @@ tests; extraction, MCPTool, batch adaptation, and the runtime rail run unchanged
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -101,19 +102,21 @@ def test_mcp_status_survives_browser_client_wrapper_and_rail(
 
     async def exercise():
         result = await native_tool.invoke({"text": "New results"})
+        transport_result = deepcopy(result)
         inputs = await _after_tool_call(
             runtime,
             tool_name="mcp_playwright-error-status_browser_wait_for",
             result=result,
             rendered=native_tool.render_for_llm(result),
         )
-        return result, inputs
+        return transport_result, inputs
 
     result, inputs = asyncio.run(exercise())
     outcome = runtime.classify_tool_result(result)
     assert outcome["success"] is not is_error
     assert inputs.tool_msg.metadata["success"] is not is_error
-    assert inputs.tool_msg.metadata["executed"] is True
+    # The upstream journal leaves failed native dispatch uncertain without a receipt.
+    assert inputs.tool_msg.metadata["executed"] is (None if is_error else True)
     if is_error:
         expected_error = response_text or "MCP tool reported an error."
         assert isinstance(result, McpToolResult)
