@@ -96,19 +96,11 @@ def test_changed_url_without_title_never_reuses_old_title():
     assert page.title == ""
 
 
-@pytest.mark.parametrize("goal", [
-    "找四星级酒店，地点不限，返回名称和价格，评分若有再提供",
-    "Find a four-star hotel, any location. Return title and price; rating if available.",
-])
-def test_optional_rating_and_unrestricted_location_are_not_required_fields(goal):
-    fields = BrowserRuntimeRail._infer_required_fields(goal)
-    assert "rating" not in fields
-    assert "address" not in fields
-    assert "price" in fields
 
 
 def test_later_local_zero_comment_evidence_replaces_empty_lookup():
     state = _state("返回评论数", ["comments"])
+    state["requirements_source"] = "explicit"
     _record(state, {"commentCountText": []})
     _record(state, {"commentHeader": "理性发言，友善互动 还没有评论，发表第一个评论吧", "commentCountText": []})
     slot = state["evidence_slots"][0]
@@ -128,6 +120,7 @@ def test_empty_alias_does_not_downgrade_positive_value_in_same_result():
 
 def test_ordered_evaluate_rows_count_actual_distinct_records_not_claimed_count():
     state = _state("Return ten result titles and links", ["title", "url"])
+    state["requirements_source"] = "explicit"
     state["requested_result_count"] = 10
     _record(state, {"count": 99, "results": [
         {"title": f"Result {i}", "href": f"https://result.test/{i}"} for i in range(10)
@@ -182,6 +175,7 @@ def test_find_result_links_are_not_current_page_metadata():
 
 def test_destination_requires_selection_and_correct_page_replaces_homepage_anchor():
     state = _state("打开搜索结果第一条，返回标题和网址", ["title", "url"])
+    state["requirements_source"] = "explicit"
     state["last_page"] = {}
     homepage = {"page_state": {"url": "https://search.test/", "title": "Search", "generation_id": "g1"}}
     BrowserRuntimeRail._record_structured_evidence(
@@ -189,7 +183,7 @@ def test_destination_requires_selection_and_correct_page_replaces_homepage_ancho
     )
     assert not state.get("evidence_slots")
     BrowserRuntimeRail._update_last_page(state, homepage)
-    assert "destination_page" in BrowserRuntimeRail._missing_completion_requirements(state)
+    assert BrowserRuntimeRail._missing_completion_requirements(state)
     state["evidence_slots"] = [{
         "entity": "page", "variant": "default", "field": "title", "value": "Stale homepage",
         "status": "present", "entity_source": "https://search.test/",
@@ -235,7 +229,7 @@ def test_card_only_answer_uses_same_sourced_observation_completion_path():
     BrowserRuntimeRail._apply_worker_progress_to_task_state(session, {"status": "completed"}, "1 SGD = 5.45 CNY.")
     payload = BrowserRuntimeRail._authoritative_terminal_payload(state)
     assert payload["status"] == "completed"
-    assert payload["unverified_fields"] == ["exchange_rate"]
+    assert "unverified_fields" not in payload
     assert payload["observations"][0]["source"] == state["last_page"]["url"]
     assert "5.45" in payload["observations"][0]["raw_text"]
     assert not payload["evidence"]  # Observations are not invented typed fields.
@@ -255,6 +249,7 @@ def test_navigation_card_cannot_supply_hotel_evidence_or_answer_observation():
 
 def test_early_empty_lookup_is_not_confirmed_absence_and_real_rating_absence_stays_partial():
     state = _state("返回商品评分", ["product_rating"])
+    state["requirements_source"] = "explicit"
     _record(state, {"product_rating": None})
     assert state["evidence_slots"][0]["observation_status"] == "not_observed"
     projection = BrowserWorkingContextStore.project_task_state(state)
@@ -275,6 +270,7 @@ def test_early_empty_lookup_is_not_confirmed_absence_and_real_rating_absence_sta
 
 def test_ordered_results_ignore_duplicates_ads_invalid_links_and_asserted_count():
     state = _state("Return search results", [])
+    state["requirements_source"] = "explicit"
     _record(state, {"count": 100, "results": [
         {"title": "One", "href": "https://result.test/1"},
         {"title": "One duplicated", "href": "https://result.test/1"},
@@ -290,6 +286,7 @@ def test_ordered_results_ignore_duplicates_ads_invalid_links_and_asserted_count(
 ])
 def test_current_part_and_collection_duration_keep_both_scopes_with_provenance(expression):
     state = _state("Return video duration", ["duration"])
+    state["requirements_source"] = "explicit"
     state["last_page"] = {"url": "https://www.bilibili.com/video/BVexample/", "title": "A course"}
     result = {"result": {"durationSec": 100533, "formatted": "27:55:33"},
               "page_state": {**state["last_page"], "generation_id": "g3"}}
@@ -306,7 +303,7 @@ def test_current_part_and_collection_duration_keep_both_scopes_with_provenance(e
 
 
 @pytest.mark.parametrize("at_checkout", [False, True])
-def test_user_payment_boundary_requires_current_page_evidence(at_checkout):
+def test_payment_page_text_does_not_invent_a_runtime_blocker(at_checkout):
     state = _state("预订一个酒店房间", [])
     state["last_page"] = {"url": "https://example.test/payment8/" if at_checkout else "https://example.test/hotel/1",
                           "title": "安全支付" if at_checkout else "Hotel details"}
@@ -314,21 +311,12 @@ def test_user_payment_boundary_requires_current_page_evidence(at_checkout):
     session = _FakeSession()
     session.update_state({STATE_KEY: state})
     BrowserRuntimeRail._apply_worker_progress_to_task_state(session, {"status": "completed"}, "Read the current page.")
-    assert (state["status"] == "blocked") is at_checkout
-    assert ("payment_required" in state.get("blockers", [])) is at_checkout
+    assert state["status"] == "completed"
+    assert "payment_required" not in state.get("blockers", [])
+    assert BrowserRuntimeRail._task_observations(state)
     assert "semantic_replan_required" not in state.get("blockers", [])
 
 
-@pytest.mark.parametrize("goal,fields", [
-    ("返回地址和评分", {"address", "rating"}),
-    ("Return hotel stars and guest rating", {"hotel_stars", "rating"}),
-    ("地点不限，找酒店", set()),
-    ("Return price and comments if available", {"price"}),
-    ("返回价格、评论数（若有）", {"price"}),
-    ("返回价格，地址若页面显示再提供，评分若显示再提供", {"price"}),
-])
-def test_required_field_qualifiers_are_local_to_each_field(goal, fields):
-    assert set(BrowserRuntimeRail._infer_required_fields(goal)) == fields
 
 
 def test_generated_card_script_classifies_navigation_and_scopes_video_duration(dom_page):
@@ -436,6 +424,7 @@ def test_card_without_ad_markers_does_not_certify_non_advertising():
 
 def test_landing_page_uses_action_source_and_related_cards_do_not_replace_its_title():
     state = _state("打开搜索结果第一条，返回标题和网址", ["title", "url"])
+    state["requirements_source"] = "explicit"
     state["structured_evidence"] = [{"source": "https://search.test/search?q=university", "cards": [{
         "title": "University", "primary_link": "https://university.test/", "region": "main_result", "is_ad": False,
     }]}]
@@ -466,6 +455,7 @@ def test_landing_page_uses_action_source_and_related_cards_do_not_replace_its_ti
 ])
 def test_nested_empty_field_is_not_confirmed_absence(item):
     state = _state("Return product rating", ["product_rating"])
+    state["requirements_source"] = "explicit"
     _record(state, {"fields": {"product_rating": item}})
     assert state["evidence_slots"][0]["observation_status"] == "not_observed"
     assert BrowserRuntimeRail._unavailable_evidence_slots(state) == []

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jsonschema import ValidationError, validate
+
 from openjiuwen.core.foundation.llm import ToolCall
 from openjiuwen.core.foundation.llm.schema.message import ToolMessage
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ToolCallInputs
@@ -22,7 +23,6 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_cont
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import BrowserWorkingContextStore
 from openjiuwen.harness.tools.browser_move.playwright_runtime.phase_contract import (
-    PHASE_KEY,
     BrowserPhaseTool,
     missing_conditions,
     observe_conditions,
@@ -79,7 +79,7 @@ def test_local_intent_needs_only_objective_and_does_not_reset_budgets():
         validate({"op": "set", "conditions": [{"type": "selected"}]}, BrowserPhaseTool(None).card.input_params)
 
 
-def test_intent_replaces_old_nodes_without_erasing_task_or_business_requirements():
+def test_current_intent_replaces_old_conditions_without_rewriting_original_requirements():
     state, condition = cart_state()
     state["required_fields"] = ["title"]
     for node in range(1, 5):
@@ -94,12 +94,12 @@ def test_intent_replaces_old_nodes_without_erasing_task_or_business_requirements
             },
             [field],
         )
-    assert len(state["phase_requirements"]) == 2
-    assert state["phase_requirements"][0]["id"] == condition["id"]
+    assert len(state["phase_requirements"]) == 1
+    assert state["phase_requirements"][0]["id"] != condition["id"]
     assert state["required_fields"] == ["title"]
     field["decision_state"]["current_value"] = "mouse"
     observe_conditions(state, {"capture_id": "new", "controls": [field], "url": "https://search.test/"})
-    assert missing_conditions(state) == [condition["id"]]
+    assert missing_conditions(state) == []
 
 
 @pytest.mark.parametrize("reading", [False, True])
@@ -208,7 +208,7 @@ async def test_search_fill_does_not_close_cart_baseline_and_exact_observation_ve
 
 @pytest.mark.parametrize("mode", ["llm", "hybrid"])
 @pytest.mark.asyncio
-async def test_cart_precondition_rejected_before_budget_in_both_modes(mode):
+async def test_valid_cart_action_is_admitted_without_baseline_in_both_modes(mode):
     state = Rail._build_phase_state("搜索鼠标并加购")
     state["decision_policy"] = {"mode": mode}
     session = session_for(state)
@@ -225,15 +225,14 @@ async def test_cart_precondition_rejected_before_budget_in_both_modes(mode):
         tool_args={"steps": [{"op": "click", "target_id": "add"}]},
     )
     ctx = AgentCallbackContext(agent=MagicMock(), session=session, inputs=inputs)
-    before = copy.deepcopy(state["phases"])
     await Rail(runtime).before_tool_call(ctx)
-    assert "cart_baseline_required" in str(ctx.inputs.tool_result)
-    assert session.get_state(PHASE_KEY)["phases"] == before
-    assert not session.get_state(PHASE_KEY).get("execution_journal")
+    assert ctx.inputs.tool_result is None  # Admitted to the unchanged executor/permission boundary.
+    assert sum(p["attempts"] for p in state["phases"].values()) == 1
+    assert state["execution_journal"][0]["execution_state"] == "prepared"
 
 
 @pytest.mark.asyncio
-async def test_cart_unknown_effect_auto_reconciles_without_phase_verify_or_policy():
+async def test_cart_effect_requires_explicit_reader_and_does_not_add_automatic_rpc():
     state, condition = cart_state()
     state.pop("decision_policy")
     session = session_for(state)
@@ -245,6 +244,9 @@ async def test_cart_unknown_effect_auto_reconciles_without_phase_verify_or_polic
     runtime.call_playwright_run_code_unsafe.return_value["items"]["mouse-black"] = 2
     captured = {"ok": True, "decision_observation": {"capture_id": "after-cart", "url": "https://shop.test/cart"}}
     await observe_runtime(runtime, session, captured)
+    assert unresolved_writes(state)
+    assert runtime.call_playwright_run_code_unsafe.await_count == 1
+    await read_cart(runtime, condition, state, baseline=False)
     assert not unresolved_writes(state)
     assert state["execution_journal"][0]["execution_state"] == "verified"
     assert condition["status"] == "unsatisfied"  # Keyboard still required.
@@ -335,17 +337,17 @@ def test_pending_business_record_survives_journal_compaction_and_reaches_parent(
     assert result["resume_context"]["execution"] == payload["execution"]
 
 
-def test_verification_budget_is_bounded_and_phase_updates_cannot_reset_it():
+def test_phase_update_does_not_create_recovery_allowances_or_terminal_state():
     state = Rail._build_phase_state("查询酒店")
     state.update(replan_required=True, replan_trial_pending=True)
     state["phases"]["extraction"]["attempts"] = 20
     session = session_for(state)
     for index in range(3):
-        assert Rail._consume_phase_budget(session, "browser_snapshot", {}) == "verification"
+        assert Rail._consume_phase_budget(session, "browser_snapshot", {}) == "target_discovery"
         set_phase(state, {"objective": f"继续 {index}"}, [])
-    with pytest.raises(ValueError, match="budget exhausted"):
-        Rail._consume_phase_budget(session, "browser_snapshot", {})
-    assert state["phases"]["extraction"]["attempts"] == 20
+    Rail._consume_phase_budget(session, "browser_snapshot", {})
+    assert state["phases"]["extraction"]["attempts"] >= 20
+    assert state["status"] == "in_progress" and not state.get("verification_recovery_counts")
 
 
 @pytest.mark.asyncio
@@ -389,7 +391,11 @@ async def test_cart_reader_failure_keeps_unknown_effect_and_available_llm_contex
     await observe_runtime(
         runtime, session, {"ok": True, "decision_observation": {"capture_id": "fresh", "url": "https://shop.test/cart"}}
     )
-    assert unresolved_writes(state) and condition["reason"] == "cart_verification_unavailable:OSError"
+    assert unresolved_writes(state)
+    runtime.call_playwright_run_code_unsafe.assert_awaited_once()
+    with pytest.raises(OSError, match="offline"):
+        await read_cart(runtime, condition, state, baseline=False)
+    assert unresolved_writes(state)
 
 
 def test_native_ax_search_fill_is_local_without_jev_target_registry():
@@ -462,12 +468,11 @@ def test_hotel_room_quantity_is_not_a_cart_mutation():
     assert not state.get("cart_write_seen") and not state.get("cart_baseline_closed")
 
 
-def test_acknowledged_unknown_cart_script_cannot_be_followed_by_another_business_write():
+def test_acknowledged_script_does_not_invent_a_cart_specific_unknown_effect():
     state, _ = cart_state()
     session = session_for(state)
     script = call("script-add", "mcp_playwright_browser_evaluate")
     script.tool_args = {"function": "() => customAdd()"}
     record(session, script, {"ok": True}, success=True)
-    assert unresolved_writes(state)
-    with pytest.raises(ValueError, match="requires_reconciliation"):
-        journal.prepare(session, call("repeat"))
+    assert not unresolved_writes(state)
+    journal.prepare(session, call("repeat"))

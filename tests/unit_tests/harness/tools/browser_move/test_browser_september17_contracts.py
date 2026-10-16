@@ -26,7 +26,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import buil
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
 from openjiuwen.harness.tools.subagent.task_tool import BROWSER_PARENT_QUERY_STATE_KEY, TaskTool
 from tests.unit_tests.harness.tools.browser_move.test_browser_page_state import _interactive, _make_bare_runtime
-from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _FakeSession, _run
+from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _declare_output, _FakeSession, _run
 
 STATE_KEY = "__browser_phase_budget_state__"
 
@@ -206,21 +206,15 @@ def test_original_query_does_not_inherit_delegated_button_enumeration():
     rail = BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime))
     child = _FakeSession()
     state = rail._ensure_task_state(child, query.task_description, original_goal=query.record["original_user_goal"])
-    assert {slot["variant"] for slot in state["required_evidence_slots"]} == {"default"}
+    assert state["required_evidence_slots"] == []
     assert "最多播放" in state["goal"]
 
 
-@pytest.mark.parametrize("task", [
-    "页面有综合、最新、最多播放按钮。切换最多播放，返回首条视频标题",
-    "找到综合、最新、最多播放，点击最多播放，告诉我第一个视频标题",
-])
-def test_button_enumeration_is_not_a_comparison_request(task):
-    slots = BrowserRuntimeRail._infer_required_evidence_slots(task)
-    assert {slot["variant"] for slot in slots} == {"default"}
 
 
 def test_genuine_comparison_retains_two_source_variants():
     state = BrowserRuntimeRail._build_phase_state("对比B站综合和最新结果，返回两个首条视频标题")
+    _declare_output(state, ['title'], entity='video', variants=('comprehensive', 'latest'))
     for order, title in (("totalrank", "First relevant"), ("pubdate", "First newest")):
         BrowserRuntimeRail._record_structured_evidence(state, {
             "result": {"title": title}, "generation_id": "g2",
@@ -242,6 +236,7 @@ def test_open_homepage_does_not_require_product_url():
 
 def test_search_card_title_cannot_certify_destination_page_title():
     state = BrowserRuntimeRail._build_phase_state("搜索清华大学，打开首条搜索结果并返回页面标题和网址")
+    _declare_output(state, ['title', 'url'], entity='page', variants=('default',))
     BrowserRuntimeRail._record_structured_evidence(state, {
         "url": "https://www.bing.com/search?q=tsinghua", "generation_id": "g1",
         "cards": [{"title": "Search title", "primary_link": "https://www.tsinghua.edu.cn/"}],
@@ -262,6 +257,7 @@ def test_search_card_title_cannot_certify_destination_page_title():
 ])
 def test_sort_click_or_homepage_step_does_not_invent_a_detail_page_requirement(task):
     state = BrowserRuntimeRail._build_phase_state(task)
+    _declare_output(state, ['title'], entity='product', variants=('default',))
     assert not BrowserRuntimeRail._requires_destination_page(state)
     BrowserRuntimeRail._record_structured_evidence(state, {
         "url": "https://shop.test/search?q=keyboard", "generation_id": "g1",
@@ -302,6 +298,7 @@ def test_empty_slots_plus_dsml_intent_is_not_completion():
 
 def test_targeted_weather_and_missing_rating_keep_provenance():
     state = BrowserRuntimeRail._build_phase_state("返回今日最高温和最低温")
+    _declare_output(state, ['high_temperature', 'low_temperature'], entity='weather', variants=('default',))
     BrowserRuntimeRail._record_structured_evidence(state, {
         "result": {"sel": "#weather", "text": "今日最高33℃，最低26℃；明天最高35℃"},
         "page_state": {"url": "https://bing.test/search?q=weather", "generation_id": "g3"},
@@ -310,7 +307,7 @@ def test_targeted_weather_and_missing_rating_keep_provenance():
     assert slots["high_temperature"]["value"] == "33"
     assert slots["low_temperature"]["selector"] == "#weather"
     assert slots["low_temperature"]["generation"] == "g3"
-    state = BrowserRuntimeRail._build_phase_state("Return product_rating")
+    state = _declare_output(BrowserRuntimeRail._build_phase_state("Return product_rating"), ["product_rating"])
     BrowserRuntimeRail._record_structured_evidence(state, {
         "result": {"product_rating": {"status": "unknown"}, "shop_rating": "4.9"},
         "page_state": {"url": "https://shop.test/item/1", "generation_id": "g3"},
@@ -324,11 +321,12 @@ def test_focused_resume_keeps_repair_instruction_and_original_constraints():
               "browser_result": {"missing_slots": ["product.default.price"], "missing_fields": ["price"]}}
     text = TaskTool._focused_browser_resume_task(record, "The old title is earrings; use the open keyboard tab")
     assert "under $100" in text and "open keyboard tab" in text
-    assert "inferred slots are not extra requirements" in text.lower()
+    assert "retained source observations" in text.lower()
 
 
 def test_corrected_entity_replaces_old_product_link_as_well_as_title_and_price():
     state = BrowserRuntimeRail._build_phase_state("Return product title, url and price")
+    _declare_output(state, ['title', 'url', 'price'], entity='product', variants=('default',))
     for item_id, title in (("2", "Earrings"), ("1", "Keyboard")):
         BrowserRuntimeRail._record_structured_evidence(state, {
             "result": {"title": title, "url": f"https://shop.test/item/{item_id}",

@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/tools/`（130 文件）、`openjiuwen/harness/schema/task.py`、`openjiuwen/core/foundation/tool/base.py`（`Tool.render_for_llm`） |
-| 最近一次修订日期 | 2026-10-12 |
+| 最近一次修订日期 | 2026-10-16 |
 | 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop |
 
 ## 范围 / 边界
@@ -99,11 +99,14 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
    自动注入的工具。runtime 内部 transport 的代码执行器不等于模型可见工具面。
    `browser_evaluate` 不进入 capability 工具列表；页面读取使用 Probe、snapshot、find 和 Batch 提取，
    runtime 内部仍可调用该 MCP 工具完成目标标记。
+   JEV 的固定 `read_text` / `find` / `scroll` / `wait` 操作继续可用；其闭合脚本分别按
+   snapshot / find 读取能力授权，不依赖向模型暴露任意 `browser_evaluate`。
    `browser_probe_cards`、`browser_probe_interactives`、`browser_snapshot`、`browser_find`
    共享显式 observation 分类（`BROWSER_OBSERVATION_TOOL_NAMES` / `is_browser_observation_tool`）。
    未带来新语义信息的读取不增加或清除交互失败计数、不挤出交互循环历史，
    也不消耗 replan trial 或将待观察的交互 trial 判为失败；新工具证据仍走现有进度恢复路径。
-   observation 分类不豁免 phase / 全局执行上限或 terminal guard；包含修改动作的组仍按交互检查。
+   phase 成本和 replan 标记继续采用 JEV 分支的指导策略，不恢复旧的强制 trial 门禁；
+   observation 分类不豁免执行安全检查、共享期限或 terminal guard；包含修改动作的组仍按交互记录。
    完整清单和当前行为统一见[浏览器子智能体](../../../../docs/zh/2.开发指南/API文档/openjiuwen.harness/subagents/浏览器子智能体.md)。
 10. **Browser 可恢复错误不消耗模型回合**：generation 刷新、单步骤 Batch primitive 改写、
     真实详情链接导航、无歧义参数别名和新标签页 URL 等待由 runtime 确定性处理；只有
@@ -156,9 +159,25 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
     逐步骤执行回执保留部分完成与未派发事实。业务验证在 llm/hybrid 中一致，见 S_18 / F_10。
 15. **Browser 输入与回执可恢复**：阶段条件按 kind 声明字段，set/verify 分开校验；错误包含
     字段路径和修正方向，绑定目标来自同一当前 guarded registry。执行器确认的反馈文本保留
-    在 journal，但不能替代业务读数。原生工具和 Batch 共用业务前置条件，见 F_11。
+    在 journal，但不能替代业务读数。原生工具和 Batch 共用执行安全边界，见 F_17。
     `browser_phase verify` 的 `inspect_cart:true` 仅执行固定 DOM 读取，返回 reader 线索；不认证
     完整性、不修改页面或关闭基线。cart_delta 的 requirement_id 允许重绑 reader，不允许改写原基线/增量。
+
+## Browser 运行时减法（F_17，当前契约）
+
+阶段计数、自然语言验收和可选条件只提供诊断，不阻断一般动作。删除阶段次数上限、
+三次核验读取配额、重规划试探/拒绝终止和价格区间特判。总截止时间、迭代数、单次等待、
+权限、串行派发、精确目标校验及真实未知效果保护保持有效。
+
+cart_delta 仅是可选工具读数，不再要求动作先建立基线，不因成功点击强制进入核验协议，
+普通观察不自动附加购物车 RPC。当前意图替换旧条件；journal 未知效果不会随之消失。
+authoritative_browser_result 保留兼容名，但权威范围限于执行/观察；业务完成由 LLM
+结合原始目标与本任务观察判断。acceptance、missing_conditions 和自动字段缺口是提示，
+不能推导“任务已认证”或“页面被锁住”。工具日志证明动作未发送时记录未派发；真实未知
+效果仍禁止盲重放。该行为同时适用于 llm/hybrid，不再由 strict/lean 切换执行真值。
+
+此前 F_10/F_12/F_13/F_16 中与本节冲突的预算、自动证明和试验开关约定由本节取代。
+详见 [F_17](../features/F_17_browser-runtime-reduction.md)。
 
 ## 接口契约
 
@@ -349,9 +368,8 @@ Control capability facts belong to the shared Runtime regardless of model mode.
 Exact AX targets can be enriched with bounded fixed DOM reads before journal preparation.
 Cross-read sort/card proofs require the same query, source, page, generation and
 interaction revision; potentially mutating actions invalidate that association.
-Ordinary reads do not consume the three explicit unknown-effect verification attempts,
-which are keyed to each outstanding effect rather than the most recent unrelated action.
-Resolving one effect cannot reset another effect's consumed attempts.
+Reads and explicit verification share the task deadline, without a separate recovery
+allowance (F_17). Resolving one effect cannot erase another effect's uncertainty.
 Jev may select registered fixed probes and source-grounded first-result navigation,
 with the same task, permission, argument and late page/node guards as other actions.
 Separately quoted sort labels do not make an otherwise unique search literal ambiguous.
@@ -363,8 +381,8 @@ No alternate executor, model-generated proof or new browser lock is introduced.
 Observed labels have one normalization. Action-result and automatic observation
 share an interaction revision; independent later changes invalidate it. Navigation
 proof binds a selected result to the actual landing page, including popup batches.
-Browser tools execute serially through the existing scheduler. Recovery trials
-are consecutive, reset by observed progress, and remain bounded by task budgets.
+Browser tools execute serially through the existing scheduler. Semantic progress is
+advisory; recovery does not need a runtime-approved trial or semantic proof (F_17).
 Model total/idle and tool timeouts are independent of the task deadline.
 
 Jev selects operation and its scoped target in a single multi-head request. Closed
@@ -381,13 +399,44 @@ navigation destinations (host and path only), covered controls with the element 
 (information only, never targets), structured target options with observed control state, and
 flags for truncated page text and unread result cards. Search terms and quoted values come from
 the user's unwrapped request (either host envelope prefix), limited to those the current intent
-names. FINISH is not offered while task requirements are missing. Any Jev failure hands back
+names. FINISH always hands back to the LLM, including when adapter fields are missing (F_17). Any Jev failure hands back
 only the current observed state. Payload and pick logs are opt-in because they carry task text.
 
 ### September 29 lean guard trial (F_16)
 
-`OPENJIUWEN_BROWSER_GUARDS=lean` enables a trial guard set, and strict is the default. In lean
-mode a cart action is an ordinary click with no cart baseline requirement. A Playwright timeout
-whose call log never reaches "performing <action>" is recorded as not dispatched rather than as
-an uncertain write. An action that was performed and then timed out stays uncertain in both
-modes. Task typing recognises buying and booking wording in both modes.
+The strict/lean trial has been superseded by F_17; the environment switch no longer changes
+execution truth. Cart actions need no mandatory baseline. A primitive whose executor log
+proves it timed out before performing the action is recorded as not dispatched. Explicit
+executed=true, performed actions, absent/truncated logs and arbitrary scripts remain uncertain
+on failure. Task typing still recognises buying and booking wording.
+
+
+## Browser 执行回执与局部连续性（F_18，2026-10-08）
+
+目标 preflight 通过只表示可尝试，不能写 executed=true。执行调用中未获 ACK 为 unknown；
+完整 Playwright Call log（先移除 ANSI 样式）证明未发送时，compact/primitive 共用 journal
+归类为未派发。复合输入已有动作的执行事实不能被后续等待错误抹掉；外层不再重放未知点击。
+
+本地 offload recall 不推进页面版本。同页、同版本、同范围卡片读取可在短观察窗口复用，
+导航、潜在写入、等待或新观察变化使缓存失效。任意脚本保持潜在写入边界。进展指纹只比较
+内容与可执行状态，不把调用历史、观察元数据和卡片重新有效算成进展；新读取记 new_observation。
+
+Jev 候选避免重交页面已经观察到的同一搜索，默认把回到已访问标签页留给 LLM 恢复；新标签仍
+可选。同对象已 ACK 的业务动作由共享 journal 排除自动重放，不新增业务成功证明。新对象、
+已执行的新输入/选择、显式新局部目标可表达后续工作；固定读取和其他局部动作继续开放。
+LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普通查询无需额外阶段调用。
+
+详见 [F_18](../features/F_18_browser-receipts-and-local-continuity.md)。
+
+## Browser 默认观察与结果交接（F_19，当前契约）
+
+默认任务不再从自然语言生成字段、数量、比较槽，不维护对应 acceptance/coverage 认证路径。
+已保存的 inferred 状态在加载/续跑时退出该路径，保留原始观察、journal、局部目标与期限。
+外部明确提供 requirements_source=explicit 的输出契约继续按既有字段形态检查，不能扩张为业务认证。
+当前搜索 URL、未映射字段和推断缺失不自动改写完成状态，也不自动创建修复调用。
+父层可显式用原 resume_task_id 纠正遗漏，受原期限和一次续跑限制；不带续跑请求的重复调用返回已有结果。
+
+统一终态携带 worker 判断、执行回执、来源观察和 summary；字段诊断不替代原文。阻断列表不是完备枚举，
+为空不能证明没有页面障碍。父层与 resume 保留同一结果；模型渲染只展示一次结果，避免三份重复投影。
+常用等待使用已有目标/文本/URL 条件；缺目标仍拒绝，旧目标校验、串行派发、权限和真实未知效果保护保留。
+本节取代 F_17 中继续默认维护 inferred 诊断和语义反证的部分，详见 [F_19](../features/F_19_browser-observation-first-results.md)。

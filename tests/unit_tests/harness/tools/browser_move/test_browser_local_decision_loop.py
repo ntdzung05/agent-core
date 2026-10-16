@@ -23,15 +23,22 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_co
 from openjiuwen.harness.tools.browser_move.playwright_runtime.evidence import observed_label
 from openjiuwen.harness.tools.browser_move.playwright_runtime.phase_contract import set_phase
 from openjiuwen.harness.tools.browser_move.playwright_runtime.policy_page_action import (
-    BrowserPageActionTool, fixed_text_script,
+    BrowserPageActionTool,
+    fixed_text_script,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserRuntimeRail as Rail
-from tests.unit_tests.harness.tools.browser_move.test_browser_jev_policy import (
-    TOOLS, choose_operation, grouped_answer, messages_for, setup_policy,
-)
 from tests.unit_tests.harness.tools.browser_move.test_browser_jev_phase_contract import session_for
+from tests.unit_tests.harness.tools.browser_move.test_browser_jev_policy import (
+    TOOLS,
+    choose_operation,
+    grouped_answer,
+    messages_for,
+    setup_policy,
+)
 from tests.unit_tests.harness.tools.browser_move.test_browser_page_state import _make_bare_runtime
-from tests.unit_tests.harness.tools.browser_move.test_browser_september17_contracts import dom_page  # noqa: F401
+from tests.unit_tests.harness.tools.browser_move.test_browser_september17_contracts import dom_page as shared_dom_page
+
+dom_page = shared_dom_page
 
 PHASE = "__browser_phase_budget_state__"
 LOCAL_TOOLS = [*TOOLS, {"name": "browser_page_action"}]
@@ -93,7 +100,7 @@ async def test_two_failed_clicks_remove_only_that_action_and_llm_recovery_reopen
     choose_operation(client, "CLICK")
     result = await policy.invoke(await messages_for(policy, context, captured), tools=LOCAL_TOOLS)
     assert result.metadata["browser_policy"]["operation"] == "click"
-    assert not session.get_state(PHASE)["decision_policy"]["failed_actions"]
+    assert session.get_state(PHASE)["decision_policy"]["failed_actions"]  # Old failures remain scoped.
     assert client.evaluate.await_count == 4
 
 
@@ -194,6 +201,7 @@ async def test_sort_receipt_and_post_action_cards_share_revision_but_later_chang
 @pytest.mark.asyncio
 async def test_combined_rpc_reuses_facts_once_and_never_after_another_action():
     runtime = _make_bare_runtime()
+    runtime.decision_policy = SimpleNamespace(decision_config=SimpleNamespace(mode="hybrid"))
     runtime.ensure_runtime_ready = AsyncMock()
     runtime.call_playwright_tool = AsyncMock()
     runtime.call_playwright_run_code_unsafe = AsyncMock(return_value={
@@ -650,18 +658,20 @@ async def test_fill_survives_a_later_failed_step_so_jev_can_submit_it():
 
 
 @pytest.mark.asyncio
-async def test_finish_is_offered_only_once_no_task_fact_is_missing():
+async def test_finish_returns_to_llm_even_with_unmapped_fields_and_cannot_certify_task():
     # Live shadow: Jev chose FINISH on the Baidu homepage while exchange_rate was still missing.
     policy, llm, client, runtime, context, captured = setup_policy()
     phase = context.get_session_ref().get_state(PHASE)
     phase["required_fields"] = ["exchange_rate"]
-    choose_operation(client, "HANDOFF")
+    choose_operation(client, "FINISH")
     result = await policy.invoke(await messages_for(policy, context, captured), tools=TOOLS)
     payload = client.evaluate.call_args.args[0]
-    assert payload["state"]["runtime_progress"]["missing_requirements"]
-    assert "FINISH" not in payload["questions"]["action"]["criteria"]
+    assert not payload["state"]["runtime_progress"]["missing_requirements"]
+    assert "FINISH" in payload["questions"]["action"]["criteria"]
     assert "HANDOFF" in payload["questions"]["action"]["criteria"]
-    assert result.metadata["browser_policy"]["excluded"]["finish_requirements_missing"] == 1
+    assert result.content == llm.invoke.return_value.content and not result.tool_calls
+    llm.invoke.assert_awaited_once()
+    assert phase.get("status") != "completed"
     phase["field_coverage"] = ["exchange_rate"]
     runtime.ensure_page_state().decision_snapshot["capture_id"] = "capture-found"
     await policy.invoke(await messages_for(policy, context, {**captured, "semantic_state": {"result_count": 1}}),

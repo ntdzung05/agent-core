@@ -192,7 +192,11 @@ _BATCH_INTERACT_PARAMS: Dict[str, Any] = {
                 "wait_for_selector, wait_for_text, wait_for_load_state, wait_for_url, "
                 "wait_for_first_card_title, wait_for_sort_state, wait_for_result_count, "
                 "wait_for_dom_text_change, wait_for_stable, wait_for_tab, extract_text, "
-                "extract_value, screenshot."
+                "extract_value, screenshot. Common waits: wait_for_selector + target_id/ref; "
+                "wait_for_text + text; wait_for_url + url_contains (also checks this action's popups). "
+                "wait_for_first_card_title/dom_text_change/sort_state/result_count require a bound target "
+                "or selector. If no expected change is known, inspect the page/tabs instead of guessing a wait. "
+                "Use optional=true for an advisory wait; its failure does not undo an earlier action ACK."
             ),
             "minItems": 1,
             "maxItems": 25,

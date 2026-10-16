@@ -20,7 +20,7 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
 )
 
 from .browser_logging import browser_agent_log_info, browser_agent_log_warning
-from .browser_working_context import BrowserWorkingContextStore
+from .browser_working_context import BrowserWorkingContextConfig, BrowserWorkingContextStore
 from .tool_categories import is_browser_observation_tool
 
 _BROWSER_STATE_MESSAGE_NAME = "current_browser_state"
@@ -198,14 +198,51 @@ class BrowserStateContextProcessor(ContextProcessor):
         state_message = self._cached_state_message
         if self.config.decision_policy is not None:
             try:
+                async def refresh_llm(messages):
+                    return await self._refresh_llm_context(context, messages, action_group_id or "initial")
+
                 metadata = await self.config.decision_policy.publish_context(
                     context, self._cached_state or {}, refresh=should_refresh, observation_only=observation_only,
+                    refresh_llm=refresh_llm,
                 )
                 state_message = state_message.model_copy(update={"metadata": {**state_message.metadata, **metadata}})
             except Exception:
                 browser_agent_log_warning("[BROWSER_POLICY] observation publication failed; use original LLM")
         context_window.context_messages.append(state_message)
         return None, context_window
+
+    async def _refresh_llm_context(self, context, messages, action_group_id):
+        """Acquire native AX at a hybrid handoff, after the compact decision has declined."""
+        if (self._cached_state or {}).get("dom"):
+            return messages
+        state = await self._capture_state(
+            action_group_id=f"{action_group_id}:llm", observation_only=True,
+            include_decision=True, force_full=True,
+        )
+        await self._preserve_projected_state(state)
+        session = context.get_session_ref() if context is not None else None
+        recovered = BrowserWorkingContextStore.sync_semantic_progress(session, state.get("semantic_progress"))
+        if recovered:
+            acknowledge = getattr(self.config.provider, "acknowledge_semantic_replan", None)
+            if callable(acknowledge):
+                acknowledge()
+        from .phase_contract import observe_runtime
+
+        await observe_runtime(self.config.provider, session, state)
+        self._cached_state = state
+        self._cached_state_message = self._build_state_message(state)
+        store = BrowserWorkingContextStore(BrowserWorkingContextConfig())
+        result = []
+        for message in messages:
+            if self._is_browser_state_message(message):
+                result.append(self._cached_state_message)
+            elif message.name == "browser_working_context":
+                result.append(message.model_copy(update={
+                    "content": store.refresh_runtime_projection(session, message.content),
+                }))
+            else:
+                result.append(message)
+        return result
 
     @classmethod
     def _completed_refresh_action_group(
@@ -387,20 +424,21 @@ class BrowserStateContextProcessor(ContextProcessor):
 
     @staticmethod
     def _is_observation_tool_name(tool_name: str) -> bool:
-        return is_browser_observation_tool(tool_name)
+        return is_browser_observation_tool(tool_name) or any(
+            str(tool_name).endswith(name) for name in ("browser_phase", "browser_page_action")
+        )
 
-    async def _capture_state(
-        self, *, action_group_id: str, include_decision: bool = False, observation_only: bool = False
-    ) -> Dict[str, Any]:
+    async def _capture_state(self, *, action_group_id: str, observation_only: bool = False,
+                             include_decision: bool = False, force_full: bool = False) -> Dict[str, Any]:
         try:
             capture = self.config.provider.capture_browser_state
-            capture_kwargs = {}
-            if include_decision:
-                capture_kwargs["include_decision"] = True
-            if observation_only:
-                capture_kwargs["observation_only"] = True
-            if capture_kwargs:
-                state = await capture(action_group_id=action_group_id, **capture_kwargs)
+            if observation_only or include_decision or force_full:
+                options = {"observation_only": True} if observation_only else {}
+                if include_decision:
+                    options["include_decision"] = True
+                if force_full:
+                    options["_allow_reconciliation"] = False
+                state = await capture(action_group_id=action_group_id, **options)
             elif action_group_id == "initial":
                 state = await capture()
             else:

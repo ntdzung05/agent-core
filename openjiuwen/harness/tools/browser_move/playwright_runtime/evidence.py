@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from itertools import chain
 from typing import Any
@@ -178,6 +179,8 @@ def explicit_acceptance(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def retain_acceptance(state: dict[str, Any]) -> None:
     """Retain task-bound proofs when the generic recent-observation window rolls over."""
+    if state.get("requirements_source") != "explicit":
+        return
     task_id = str(state.get("query_id") or state.get("task_id") or "")
     saved = state.setdefault("acceptance_evidence", {})
     for item in explicit_acceptance(state):
@@ -193,6 +196,8 @@ def _is_selected_sort(control: dict[str, Any]) -> bool:
 
 def observe_acceptance(state: dict[str, Any], observation: dict[str, Any]) -> None:
     """Consume the existing fresh capture; no extra browser or model call."""
+    if state.get("requirements_source") != "explicit":
+        return
     source = observation.get("url") or ""
     if not observation.get("capture_id") or not evidence_subject(source):
         return
@@ -236,22 +241,6 @@ def requires_destination_page(goal: Any) -> bool:
     return False
 
 
-def completion_contradiction(result: dict[str, Any], goal: str) -> str:
-    """A small, evidence-based correction allowance, never a new verifier."""
-    for slot in result.get("evidence") or []:
-        if isinstance(slot, dict) and slot.get("field") == "author" and author_is_action_label(slot.get("value")):
-            return "author_is_action_label"
-    current = result.get("current_page") or {}
-    try:
-        page = urlsplit(str(current.get("url") or ""))
-    except ValueError:
-        return ""
-    search_page = bool(re.search(r"/(?:search|s|results|all)(?:/|$)", page.path)) or bool(
-        {"wd", "search_query"}.intersection(parse_qs(page.query))
-    )
-    if search_page and requires_destination_page(goal):
-        return "destination_page_not_visited"
-    return ""
 
 
 def today_temperature_fields(value: Any) -> tuple[dict[str, str], str]:
@@ -416,3 +405,33 @@ def merge_evidence_slot(
         return
     slots.append(slot)
     del slots[:-20]
+
+
+def source_observations(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project existing source records without interpreting their business fields."""
+    query_id = str(state.get("query_id") or state.get("task_id") or "")
+    observations = []
+    records = [*(state.get("evidence_slots") or []), *(state.get("structured_evidence") or [])]
+    for record in records:
+        if not isinstance(record, dict) or record.get("query_id", query_id) != query_id:
+            continue
+        provenance = record.get("provenance") or {}
+        source = record.get("source") or record.get("entity_url")
+        if not source:
+            source = next((p.get("source") for p in provenance.values()
+                           if isinstance(p, dict) and p.get("source")), None)
+        if not source:
+            continue
+        content = record.get("raw_text")
+        if not content:
+            content = {k: record[k] for k in ("values", "cards", "value", "field_status", "preview")
+                       if k in record}
+        if not content:
+            continue
+        observations.append({
+            "kind": record.get("kind", "extraction"), "source": source,
+            "generation_id": record.get("generation_id") or record.get("generation"),
+            "raw_text": (content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))[:4000],
+            "provenance": {k: provenance[k] for k in ("tool", "target", "expression_sha256") if k in provenance},
+        })
+    return observations

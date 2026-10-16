@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
 from openjiuwen.harness.tools.browser_move.decision.action_space import build_menu
 from openjiuwen.harness.tools.browser_move.decision.guard import (
     DecisionGuard,
@@ -62,9 +63,12 @@ from tests.unit_tests.harness.tools.browser_move.test_browser_p0_closure import 
 from tests.unit_tests.harness.tools.browser_move.test_browser_page_state import (
     _make_bare_runtime,
 )
+from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _declare_output
 from tests.unit_tests.harness.tools.browser_move.test_browser_september17_contracts import (
-    dom_page,  # noqa: F401
+    dom_page as shared_dom_page,
 )
+
+dom_page = shared_dom_page
 
 
 def invoke_args(name, args, call_id="call_search"):
@@ -297,6 +301,7 @@ def test_search_observation_can_reconcile_only_bound_local_effects(impact, url, 
 
 def test_primitive_link_navigation_records_actual_landing_title_after_redirect():
     state = Rail._build_phase_state("打开百度首页，搜索清华大学，进入第一条结果，返回页面标题")
+    _declare_output(state, ['title'], entity='page', variants=('default',))
     source = "https://www.baidu.com/s?wd=清华大学"
     state["last_page"] = {"url": source}
     state["structured_evidence"] = [{"source": source, "cards": [first_card()]}]
@@ -323,7 +328,7 @@ def test_primitive_link_navigation_records_actual_landing_title_after_redirect()
     assert any(record.get("destination_verified") for record in state["structured_evidence"])
 
 
-def test_verification_counts_do_not_reset_when_only_one_of_two_effects_is_resolved():
+def test_resolving_one_effect_neither_blocks_reads_nor_clears_other_effect():
     state = Rail._build_phase_state("检查待核对效果")
     state["execution_journal"] = [
         dict(call_id=key, impact="business", execution_state="dispatched_unknown") for key in ("one", "two")
@@ -332,23 +337,30 @@ def test_verification_counts_do_not_reset_when_only_one_of_two_effects_is_resolv
     for _ in range(3):
         Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
     state["execution_journal"][0]["execution_state"] = "verified"
-    with pytest.raises(ValueError, match="verification_recovery_budget_exhausted"):
-        Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
+    Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
+    assert state["execution_journal"][1]["execution_state"] == "dispatched_unknown"
 
 
 @pytest.mark.asyncio
-async def test_capability_observation_cannot_overrun_task_deadline_and_dispatch():
+async def test_capability_observation_cannot_overrun_task_deadline_and_dispatch(monkeypatch):
     runtime = _make_bare_runtime()
-    runtime.enrich_action_capabilities = AsyncMock(side_effect=lambda _: asyncio.sleep(1))
+    now = [time.time()]
+    clock = SimpleNamespace(**vars(time))
+    clock.time = lambda: now[0]
+    monkeypatch.setattr("openjiuwen.harness.tools.browser_move.playwright_runtime.runtime.time", clock)
 
     async def slow_observation(_):
+        # Wall-clock expiry is deterministic even if the Windows event-loop timer fires early.
+        now[0] += 1
         await asyncio.sleep(1)
 
-    runtime.enrich_action_capabilities.side_effect = slow_observation
+    runtime.enrich_action_capabilities = AsyncMock(side_effect=slow_observation)
     state = Rail._build_phase_state("搜索天气")
-    state["deadline_at"] = time.time() + 0.02
+    state["deadline_at"] = now[0] + 0.02
     session = session_for(state)
-    inputs = invoke_args("browser_batch_interact", {"generation_id": "g0", "steps": [{"op": "click", "target_id": "x"}]})
+    inputs = invoke_args(
+        "browser_batch_interact", {"generation_id": "g0", "steps": [{"op": "click", "target_id": "x"}]}
+    )
     context = SimpleNamespace(inputs=inputs, session=session, extra={}, agent=None)
     with pytest.raises(ValueError, match="deadline_exhausted_during_observation"):
         await Rail(runtime)._prepare_tool_call(context)
@@ -385,6 +397,7 @@ def test_sort_card_join_rejects_unrelated_or_stale_records(change):
 
 def test_runtime_stamps_and_retains_split_observations():
     state = search_state("")
+    state["requirements_source"] = "explicit"
     state["structured_evidence"] = []
     source = state["last_page"]["url"]
     page = BrowserPageState()
@@ -412,7 +425,7 @@ def test_runtime_stamps_and_retains_split_observations():
     assert all(r["status"] == "satisfied" for r in explicit_acceptance(state))
 
 
-def test_ordinary_reads_do_not_steal_unknown_effect_verification_allowance():
+def test_reads_and_optional_verify_do_not_create_a_separate_recovery_allowance():
     state = Rail._build_phase_state("查看购物车数量")
     state["execution_journal"] = [
         {"call_id": "uncertain", "execution_state": "dispatched_unknown", "impact": "business"}
@@ -422,13 +435,13 @@ def test_ordinary_reads_do_not_steal_unknown_effect_verification_allowance():
         Rail._consume_phase_budget(session, "browser_probe_interactives", {})
     assert not state.get("verification_recovery_counts")
     for index in range(3):
-        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "verification"
+        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "management"
         state["execution_journal"].append(
             {"call_id": f"sort-{index}", "execution_state": "acknowledged", "impact": "local_ui"}
         )
-    with pytest.raises(ValueError, match="verification_recovery_budget_exhausted"):
-        Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
-    assert state["verification_recovery_counts"] == {"effects:uncertain": 3}
+    Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
+    assert not state.get("verification_recovery_counts")
+    assert state["execution_journal"][0]["execution_state"] == "dispatched_unknown"
 
 
 def test_first_result_never_compiles_second_result_click_and_reads_when_order_missing():
@@ -546,8 +559,10 @@ def test_first_result_late_guard_runs_real_dom_and_rejects_reordered_results(dom
             content_type="text/html",
             body="""
         <style>.result {width:650px;height:180px;margin:12px}</style>
-        <div id="content_left"><div class="result c-container"><h3><a href="https://first.test/">First university</a></h3>
-        <p>Official university site</p></div><div class="result c-container"><h3><a href="https://second.test/">Second university</a></h3>
+        <div id="content_left"><div class="result c-container"><h3>
+        <a href="https://first.test/">First university</a></h3>
+        <p>Official university site</p></div><div class="result c-container"><h3>
+        <a href="https://second.test/">Second university</a></h3>
         <p>Encyclopedia entry</p></div></div>""",
         ),
     )

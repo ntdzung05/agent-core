@@ -34,6 +34,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import Bro
 from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
 from openjiuwen.harness.tools.browser_move.playwright_runtime.service_registry import BrowserServiceRegistry
 from openjiuwen.harness.tools.subagent.task_tool import EXECUTION_DEADLINE_STATE_KEY, TaskTool
+from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _declare_output
 
 
 @pytest.mark.asyncio
@@ -89,6 +90,7 @@ async def test_cancelled_waiter_does_not_take_browser_or_leak_lock():
 
 def _state(fields):
     state = BrowserRuntimeRail._build_phase_state("Read the first product")
+    state["requirements_source"] = "explicit"
     state["required_fields"] = fields
     state["required_evidence_slots"] = [
         {"entity": "product", "variant": "default", "field": field} for field in fields
@@ -128,6 +130,7 @@ def _record(state, value):
 
 def test_reused_keyboard_page_does_not_confirm_headphone_sort():
     state = BrowserRuntimeRail._build_phase_state("搜索蓝牙耳机，返回销量排序")
+    _declare_output(state, ['sort_state'], entity='product', variants=('default',))
     progress = {"semantic_state": {
         "url": "https://s.taobao.com/search?q=机械键盘", "generation_id": "g0",
         "selected_filters": [{"key": "sort", "value": "销量"}],
@@ -189,6 +192,7 @@ def test_final_renderer_prefers_latest_resume_summary():
 
 def test_weather_today_range_closes_fields_without_another_model_round():
     state = BrowserRuntimeRail._build_phase_state("查看西安天气，返回今天最高温和最低温")
+    _declare_output(state, ['high_temperature', 'low_temperature'], entity='weather', variants=('default',))
     result = normalize_card_probe_payload({
         "ok": True, "url": "https://www.baidu.com/s?wd=西安天气", "generation_id": "g2",
         "cards": [

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jsonschema import ValidationError, validate
+
 from openjiuwen.core.foundation.llm import ModelClientConfig, ModelRequestConfig
 from openjiuwen.harness.subagents.browser_agent import _browser_model_with_temperature
 from openjiuwen.harness.tools.browser_move.playwright_runtime import cart_verification as cart
@@ -28,6 +29,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.phase_contract imp
     PhaseInputError,
     binding_targets,
     set_phase,
+    unresolved_writes,
     validate_request,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import build_interactive_probe_js
@@ -163,7 +165,7 @@ def search_state(order="price-asc", *, goal="搜索蓝牙耳机，按销量排�
     return state
 
 
-def test_weak_query_phase_cannot_certify_sales_sort_or_parent_completed():
+def test_weak_query_phase_retains_sort_gaps_as_advisory_not_global_veto():
     state = search_state()
     set_phase(
         state,
@@ -172,14 +174,16 @@ def test_weak_query_phase_cannot_certify_sales_sort_or_parent_completed():
     )
     session = session_for(state)
     Rail._apply_worker_progress_to_task_state(session, {"status": "completed"}, "已完成，第一条耳机A")
-    assert state["status"] == "partial"
+    assert state["status"] == "completed"
     result = Rail._authoritative_terminal_payload(state)
-    assert "sort:sales" in result["missing_fields"] and "first_result:sales" in result["missing_fields"]
-    assert result["status"] != "completed"
+    assert "acceptance" not in result
+    assert result["observations"]
+    assert result["missing_fields"] == [] and result["completion_basis"] == "worker_judgment"
 
 
 def test_sales_sort_and_first_result_proof_survive_node_rebinding_and_bounded_history():
     state = search_state("sale-desc")
+    state["requirements_source"] = "explicit"
     assert all(r["status"] == "satisfied" for r in explicit_acceptance(state))
     retain_acceptance(state)
     state["structured_evidence"] = [{"kind": "page_observation", "source": "https://item.taobao.com/item.htm?id=123"}]
@@ -210,6 +214,7 @@ def test_sort_and_first_result_evidence_cannot_be_invented_from_tool_intent(unpr
 
 def test_fresh_observation_proves_sort_without_extra_phase_call():
     state = search_state("sale-desc", goal="当前页面切换到销量排序")
+    state["requirements_source"] = "explicit"
     state["structured_evidence"] = []
     observe_acceptance(state, {"url": state["last_page"]["url"], "capture_id": "new", "controls": []})
     assert explicit_acceptance(state)[0]["status"] == "satisfied"
@@ -233,7 +238,7 @@ def test_product_and_shop_rating_are_not_interchangeable_and_optional_is_advisor
 
 
 @pytest.mark.asyncio
-async def test_lazada_unbound_click_plus_added_is_guarded_before_dispatch_and_preserves_feedback():
+async def test_added_feedback_survives_without_a_mandatory_cart_contract():
     state, condition = cart_state()
     session = session_for(state)
     inputs = call("llm_add")
@@ -242,31 +247,29 @@ async def test_lazada_unbound_click_plus_added_is_guarded_before_dispatch_and_pr
         {"op": "wait_for_text", "text": "Added"},
     ]
     runtime = cart_runtime({"old-item": 2, "mouse-black": 1})
-    with pytest.raises(ValueError, match="cart_baseline_required"):
-        journal.prepare(session, inputs, runtime, effect_adapter=cart.prepare_effects)
-    assert not state.get("execution_journal")
-    await cart.read_cart(runtime, condition, state, baseline=True)
     journal.prepare(session, inputs, runtime, effect_adapter=cart.prepare_effects)
     journal.record_result(
         session, inputs, {"success": True}, {"steps": [{"index": 0, "ok": True}, {"index": 1, "ok": True}]}
     )
     cart.record_effects(state, "llm_add")
     result = Rail._authoritative_terminal_payload(state)
-    assert result["execution"]["unresolved"][0]["steps"][1]["observed_feedback"] == "Added"
-    assert state["cart_write_seen"] and "unknown_browser_write" in result["missing_fields"]
+    assert result["execution"]["recent"][0]["steps"][1]["observed_feedback"] == "Added"
+    assert not unresolved_writes(state)
+    assert condition["status"] == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_failed_cart_read_cannot_reuse_old_valid_preflight():
+async def test_failed_optional_reader_is_not_an_action_precondition():
     state, condition = cart_state()
     runtime = cart_runtime({"old-item": 2, "mouse-black": 1})
     await cart.read_cart(runtime, condition, state, baseline=True)
     baseline = copy.deepcopy(condition["baseline"])
     runtime.call_playwright_run_code_unsafe.return_value = {"ok": False}
     await cart.read_cart(runtime, condition, state, baseline=False)
-    with pytest.raises(ValueError, match="cart_baseline_required"):
-        journal.prepare(session_for(state), call(), runtime, effect_adapter=cart.prepare_effects)
+    journal.prepare(session_for(state), call(), runtime, effect_adapter=cart.prepare_effects)
     assert condition["baseline"] == baseline
+    assert state["execution_journal"][0]["cart_mutation"] is False
+    assert condition["status"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -316,18 +319,17 @@ async def test_observed_wrong_sku_cannot_use_another_products_baseline():
         journal.prepare(session_for(state), call(), runtime, effect_adapter=cart.prepare_effects)
 
 
-def test_exhausted_action_budget_keeps_three_reads_without_resetting_budget():
+def test_phase_count_is_telemetry_and_does_not_start_a_verification_only_lane():
     state = Rail._build_phase_state("搜索耳机返回标题")
     state["phases"]["extraction"]["attempts"] = state["phases"]["extraction"]["budget"]
     state["deadline_at"] = time.time() + 30
     session = session_for(state)
-    with pytest.raises(ValueError, match="budget exhausted"):
-        Rail._consume_phase_budget(session, "browser_probe_cards", {})
+    Rail._consume_phase_budget(session, "browser_probe_cards", {})
     for _ in range(3):
-        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "verification"
-    with pytest.raises(ValueError, match="action_budget_exhausted"):
-        Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
-    assert state["status"] == "partial" and state["phases"]["extraction"]["attempts"] == 20
+        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "management"
+    Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"})
+    assert state["status"] == "in_progress" and state["phases"]["extraction"]["attempts"] == 21
+    assert not state.get("action_budget_exhausted")
 
 
 @pytest.mark.parametrize("configured,expected", [(300, 90), (20, 20), (None, 90)])
@@ -383,7 +385,7 @@ async def test_first_chunk_timeout_preserves_execution_and_does_not_replay_model
     result = ctx.request_force_finish.call_args.args[0]
     facts = result["authoritative_browser_result"]
     assert facts["execution"]["business_effects"][0]["steps"][0]["observed_feedback"] == "Added"
-    assert not facts["observed_blockers"] and facts["unconfirmed_blockers"] == ["need a future guest name"]
+    assert not facts.get("observed_blockers", []) and facts["unconfirmed_blockers"] == ["need a future guest name"]
     data = TaskTool._build_result_data(
         result, result["output"], agent_id="browser", subagent_type="browser_agent", sub_session_id="sub"
     )
@@ -502,15 +504,15 @@ def test_card_selected_sort_proves_variant_even_when_url_has_no_order():
     assert variant == "latest"
 
 
-def test_phase_verify_shares_bounded_unknown_write_recovery_lane():
+def test_optional_verify_does_not_clear_or_exhaust_unknown_write_recovery():
     state, _ = cart_state()
     state["execution_journal"] = [{"call_id": "add", "execution_state": "dispatched_unknown", "impact": "business"}]
     session = session_for(state)
     for _ in range(3):
-        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "verification"
+        assert Rail._consume_phase_budget(session, "browser_phase", {"op": "verify"}) == "management"
     assert Rail._consume_phase_budget(session, "browser_phase", {"op": "set", "objective": "inspect"}) == "management"
-    with pytest.raises(ValueError, match="verification_recovery_budget_exhausted"):
-        Rail._consume_phase_budget(session, "browser_phase", {"op": "verify", "inspect_cart": True})
+    Rail._consume_phase_budget(session, "browser_phase", {"op": "verify", "inspect_cart": True})
+    assert unresolved_writes(state)
 
 
 def test_result_change_without_selected_order_cannot_certify_sort():

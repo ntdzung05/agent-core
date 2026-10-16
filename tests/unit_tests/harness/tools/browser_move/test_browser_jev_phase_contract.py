@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
 from openjiuwen.harness.tools.browser_move.decision.action_space import build_menu
 from openjiuwen.harness.tools.browser_move.decision.policy_model import (
     BrowserPolicyModel,
@@ -76,7 +77,7 @@ def new_state():
     }
 
 
-def test_bilibili_g3_latest_must_not_return_to_default_g4():
+def test_sort_observation_is_advisory_and_new_intent_replaces_conditions():
     state = new_state()
     controls = [control("default", "综合排序", 1), control("latest", "最新发布", 2)]
     conditions = [
@@ -115,7 +116,7 @@ def test_bilibili_g3_latest_must_not_return_to_default_g4():
     observe_conditions(state, snapshot)
     menu = build_menu(controls, state["goal"], limit=30)
     constrain_actions(menu, state, controls)
-    assert not menu.steps  # Both sort toggles are unnecessary; extraction is next.
+    assert menu.steps  # A URL/sort-name heuristic no longer bans all other controls.
     assert state["active_phase_contract"]["status"] == "in_progress"
     state["evidence_slots"].append(
         {
@@ -323,7 +324,7 @@ async def test_add_timeout_blocks_both_models_until_actual_partial_delta_is_read
         {"old-item": 2, "mouse-black": 2, "keyboard-uk": 1},  # Wrong variant.
     ],
 )
-async def test_cart_business_postconditions_reject_tool_ok_and_nonempty_cart(observed):
+async def test_optional_cart_reader_retains_mismatch_without_certifying_business_completion(observed):
     state, condition = cart_state()
     runtime = cart_runtime({"old-item": 2, "mouse-black": 1})
     await read_cart(runtime, condition, state, baseline=True)
@@ -333,7 +334,11 @@ async def test_cart_business_postconditions_reject_tool_ok_and_nonempty_cart(obs
     state.update(requirements_source="inferred", evidence_slots=[{"value": "cart is nonempty"}])
     session = session_for(state)
     BrowserRuntimeRail._apply_worker_progress_to_task_state(session, {"status": "completed"}, "全部加购成功")
-    assert session.get_state(PHASE_KEY)["status"] == "partial"
+    result = BrowserRuntimeRail._authoritative_terminal_payload(state)
+    assert result["status"] == "completed"  # Worker judgment, not runtime cart certification.
+    assert "missing_conditions" not in result
+    assert condition["status"] == "unsatisfied"
+    assert result["completion_basis"] == "worker_judgment"
 
 
 @pytest.mark.asyncio
@@ -602,8 +607,10 @@ async def test_verified_cart_quantities_do_not_prove_a_requested_total():
     session = session_for(state)
     BrowserRuntimeRail._apply_worker_progress_to_task_state(session, {"status": "completed"}, "全部完成，合计100")
     result = session.get_state(PHASE_KEY)
-    assert result["status"] == "partial"
-    assert any("cart_total_requires_observed_evidence" in blocker for blocker in result["blockers"])
+    assert result["status"] == "completed"
+    assert not any(s.get("field") == "cart_total" for s in result["evidence_slots"])
+    result = BrowserRuntimeRail._authoritative_terminal_payload(state)
+    assert result["verification_scope"] == "execution_and_observations"
 
 
 @pytest.mark.asyncio

@@ -44,8 +44,8 @@ def browser_flow(monkeypatch):
     runtime._selector_primary_links = {}
     runtime._last_observed_url = ""
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._call_playwright_tool = AsyncMock(return_value='- textbox "Search" [ref=e1]')
-    runtime._call_playwright_run_code_unsafe = AsyncMock(
+    runtime.call_playwright_tool = AsyncMock(return_value='- textbox "Search" [ref=e1]')
+    runtime.call_playwright_run_code_unsafe = AsyncMock(
         return_value={
             "ok": True,
             "url": "https://example.test/search",

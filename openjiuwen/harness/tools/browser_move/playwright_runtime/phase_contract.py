@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import parse_qs, urlsplit
 
 from jsonschema import Draft202012Validator
+
 from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
@@ -284,11 +285,10 @@ def set_phase(state: dict[str, Any], args: dict[str, Any], controls: list[dict[s
     specs = args.get("conditions", [])
     if not isinstance(specs, list) or len(specs) > 12:
         raise ValueError("phase_requires_bounded_conditions")
-    # Node/URL conditions belong to the previous local intent, not permanent
-    # user requirements. Durable evidence and business effects survive replans.
-    requirements = copy.deepcopy(
-        [item for item in state.get("phase_requirements", []) if item["kind"] in {"evidence", "cart_delta"}]
-    )
+    # Conditions describe only the current fragment. Rebinding does not accumulate
+    # permanent business requirements; execution uncertainty lives in the journal.
+    previous = copy.deepcopy(state.get("phase_requirements", []))
+    requirements = []
     new_conditions = []
     for index, source in enumerate(specs):
         if not isinstance(source, dict) or source.get("kind") not in CONDITIONS:
@@ -355,9 +355,9 @@ def set_phase(state: dict[str, Any], args: dict[str, Any], controls: list[dict[s
             ):
                 raise ValueError("cart_requires_preserve_existing")
         # An identical condition retains its original evidence/baseline.
-        existing = next((item for item in requirements if item["spec"] == spec), None)
+        existing = next((item for item in previous if item["spec"] == spec), None)
         logical_id = spec.get("requirement_id")
-        rebound = next((item for item in requirements if item["spec"].get("requirement_id") == logical_id), None) \
+        rebound = next((item for item in previous if item["spec"].get("requirement_id") == logical_id), None) \
             if logical_id else None
         if existing is None and rebound is not None:
             mutable = {"items_selector", "sku_attribute", "quantity_selector", "count_selector"}
@@ -371,8 +371,6 @@ def set_phase(state: dict[str, Any], args: dict[str, Any], controls: list[dict[s
             rebound.update(spec=spec, status="unknown", reason="cart_reader_rebound_requires_read")
             existing = rebound
         if existing is None:
-            if len(requirements) >= 64:
-                raise ValueError("phase_requirement_budget_exhausted")
             existing = {
                 "id": f"requirement:{logical_id}" if logical_id else f"phase-{version}-{index}",
                 "kind": kind,
@@ -380,6 +378,7 @@ def set_phase(state: dict[str, Any], args: dict[str, Any], controls: list[dict[s
                 "status": "unknown",
                 "phase_version": version,
             }
+        if existing not in requirements:
             requirements.append(existing)
         new_conditions.append(existing["id"])
     current = state.get("active_phase_contract") or {}
@@ -401,18 +400,6 @@ def set_phase(state: dict[str, Any], args: dict[str, Any], controls: list[dict[s
                         "replaced_by": version})
         del history[:-6]
     state["phase_requirements"] = requirements
-    slots = state.setdefault("required_evidence_slots", [])
-    fields = state.setdefault("required_fields", [])
-    for requirement in requirements:
-        if requirement["kind"] != "evidence":
-            continue
-        spec = requirement["spec"]
-        entity = spec.get("entity") or (slots[0].get("entity") if slots else "task")
-        requested = {"entity": entity, "variant": spec["variant"], "field": spec["field"]}
-        if requested not in slots:
-            slots.append(requested)
-        if spec["field"] not in fields:
-            fields.append(spec["field"])
     state["active_phase_contract"] = {
         "version": version,
         "objective": objective,
@@ -528,13 +515,6 @@ def constrain_actions(menu: Any, state: dict[str, Any], controls: list[dict[str,
         satisfied = item["id"] in phase["condition_ids"] and item["status"] == "satisfied"
         if satisfied and item["kind"] in {"control_value", "control_selected"}:
             selected_targets.append((item["spec"]["target"], item["kind"]))
-    sort_applied = any(
-        item["id"] in phase["condition_ids"]
-        and item["status"] == "satisfied"
-        and item["kind"] == "url_query"
-        and item["spec"]["key"] in {"order", "sort", "sortBy"}
-        for item in state.get("phase_requirements", [])
-    )
     for key, step in list(menu.steps.items()):
         control = current.get(step.get("target_id"))
         # Satisfied optional conditions do not finish the intent. For example,
@@ -550,15 +530,6 @@ def constrain_actions(menu: Any, state: dict[str, Any], controls: list[dict[str,
             if any(
                 same_node(target, control) and (kind == "control_selected" or step["op"] in {"fill", "select_option"})
                 for target, kind in selected_targets
-            ):
-                allowed = False
-            if sort_applied and (
-                str(control.get("kind", "")).startswith("sort")
-                or re.search(
-                    r"排序|综合|最新|销量|sort|newest|relevance|price",
-                    str(control.get("name", "")),
-                    re.I,
-                )
             ):
                 allowed = False
         if not allowed:
@@ -589,13 +560,11 @@ class BrowserPhaseTool(Tool):
                     "control_selected {kind,target_id}, url_query {kind,key,value}, url {kind,value}, "
                     "evidence {kind,field,variant,query OR source,entity?}, cart_delta {kind,items_selector,"
                     "sku_attribute,quantity_selector,count_selector,deltas:{sku:integer},preserve_existing:true}. "
-                    "Cart baseline needs stable SKU+variant and unique numeric distinct-line count BEFORE a "
-                    "cart mutation. Local search fills are allowed before baseline. preserve_existing:false "
-                    "checks only target SKUs when the user does not require whole-cart preservation. "
-                    "Normal observations auto-verify available facts. Verify requests fresh evidence and may "
-                    "omit phase_version. Set replaces temporary bindings, retaining user evidence requirements, "
-                    "cart baselines and unresolved effects. A cart_delta may use requirement_id to rebind its reader "
-                    "without changing deltas/preservation or resetting baseline. Never submit success/proof."
+                    "Conditions are advisory and replaced with the current intent. Normal observations reuse "
+                    "available facts; verify optionally reads fresh facts. Cart readers are optional, never a "
+                    "prerequisite for actions or completion. A delta needs a real pre-action baseline to be "
+                    "reported as verified; an unsupported reader is not a task blocker. "
+                    "Unknown execution effects survive intent changes. Never submit success/proof."
                 ),
                 input_params=copy.deepcopy(PHASE_SCHEMA),
             )
@@ -728,7 +697,6 @@ class BrowserPhaseTool(Tool):
 
 async def observe_runtime(runtime: Any, session: Any, captured: dict[str, Any]) -> None:
     """Shared lifecycle hook, independent of whether a decision model is installed."""
-    from .cart_verification import observe_cart
     from .execution_journal import reconcile_observation
 
     state = task_state(session)
@@ -740,6 +708,4 @@ async def observe_runtime(runtime: Any, session: Any, captured: dict[str, Any]) 
     observe_conditions(state, observation)
     observe_acceptance(state, observation)
     reconcile_observation(state, observation)
-    await observe_cart(runtime, state, observation)
-    observe_conditions(state, observation)
     save(session, state)

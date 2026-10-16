@@ -49,6 +49,7 @@ def test_result_decoder_keeps_error_and_does_not_mine_json_from_page_or_code():
 
 def test_real_mcp_array_wrapper_and_relative_urls_share_the_evidence_path():
     state = _state("Return first five titles", ["title"])
+    state["requirements_source"] = "explicit"
     state["last_page"]["url"] = "https://search.test/search?q=lesson"
     state["requested_result_count"] = 5
     rows = [{"title": f"Lesson {i}", "href": f"//video.test/lesson/{i}"} for i in range(5)]
@@ -61,6 +62,7 @@ def test_real_mcp_array_wrapper_and_relative_urls_share_the_evidence_path():
 
 def test_array_extraction_uses_same_ai_classification_as_probe():
     state = _state("Return search results", [])
+    state["requirements_source"] = "explicit"
     state["last_page"]["url"] = "https://www.google.com/search?q=calculator"
     _record(state, [
         {"title": "Calculator", "href": "https://example.test/1"},
@@ -75,6 +77,7 @@ def test_array_extraction_uses_same_ai_classification_as_probe():
 
 def test_redirect_is_proved_by_this_successful_navigation_not_another_tabs_cache():
     state = _state("Open the first search result and return title", ["title"])
+    state["requirements_source"] = "explicit"
     state["last_page"] = {"url": "https://search.test/search?q=university", "title": "Results"}
     args = {"url": "https://search.test/link?token=123"}
     state["structured_evidence"] = [{"source": state["last_page"]["url"], "cards": [{
@@ -264,7 +267,7 @@ def test_inferred_fields_count_and_variants_are_not_a_second_completion_judge():
     result = _finish(state)
     assert result["status"] == "completed"
     assert result["missing_fields"] == [] and result["missing_slots"] == []
-    assert "novel_field" in result["unverified_fields"]
+    assert "unverified_fields" not in result
     assert not result["retryable"]
     assert result["observations"]
 

@@ -38,10 +38,6 @@ def test_add_to_cart_without_a_cart_contract(guards):
     # Lazada: every Add to cart was refused although the user was logged in.
     state = no_contract_state()
     session = session_for(state)
-    if guards == "strict":
-        with pytest.raises(ValueError, match="cart_baseline_required"):
-            journal.prepare(session, call("jev_add"), cart_runtime({}), effect_adapter=cart.prepare_effects)
-        return
     journal.prepare(session, call("jev_add"), cart_runtime({}), effect_adapter=cart.prepare_effects)
     assert state["execution_journal"][0]["cart_mutation"] is False
 
@@ -55,11 +51,6 @@ def test_click_timed_out_before_being_performed_is_not_an_uncertain_write(guards
     journal.record_result(session, first, {"success": False},
                           {"steps": [{"index": 0, "ok": False, "error": NEVER_PERFORMED}]})
     [entry] = state["execution_journal"]
-    if guards == "strict":
-        assert entry["execution_state"] == "dispatched_unknown" and unresolved_writes(state)
-        with pytest.raises(ValueError, match="browser_write_requires_reconciliation"):
-            journal.prepare(session, call("llm_click_again"), cart_runtime({}))
-        return
     assert entry["execution_state"] == "rejected_before_dispatch" and not unresolved_writes(state)
     journal.prepare(session, call("llm_click_again"), cart_runtime({}))  # Not locked.
 

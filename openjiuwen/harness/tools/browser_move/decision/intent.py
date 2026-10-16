@@ -82,7 +82,8 @@ def search_values(goal: str) -> list[str]:
     goal = normalize_goal(goal)
     values = []
     for match in re.finditer(
-        r"(?:搜索(?!结果|按钮|框|栏|页)|查询(?!结果|按钮|框)|search(?!\s*(?:results?\b|box\b))(?: for)?|look up)\s*[:：]?\s*",
+        r"(?:搜索(?!结果|按钮|框|栏|页)|查询(?!结果|按钮|框)|"
+        r"search(?!\s*(?:results?\b|box\b))(?: for)?|look up)\s*[:：]?\s*",
         goal, re.I,
     ):
         tail = goal[match.end():]
@@ -114,7 +115,7 @@ def search_values(goal: str) -> list[str]:
 
 def explicit_urls(goal: str) -> list[str]:
     urls = []
-    for match in re.finditer(r'https?://[^\s<>"“”「」，。；]+', normalize_goal(goal)):
+    for match in re.finditer(r'https?://[^\s<>`"“”「」，。；]+', normalize_goal(goal)):
         url = match.group().rstrip(".,;)")
         try:
             parsed = urlsplit(url)

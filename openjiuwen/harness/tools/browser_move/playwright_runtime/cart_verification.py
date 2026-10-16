@@ -9,7 +9,6 @@ import time
 from typing import Any
 
 from ..utils.parsing import decode_mcp_result
-from .browser_logging import browser_agent_log_info
 from .evidence import same_page_url
 
 # One fixed read, bounded rows, duplicate/missing identities are errors. No page
@@ -188,13 +187,11 @@ def _has_open_baseline(condition: dict[str, Any]) -> bool:
 
 
 def prepare_effects(entry: dict[str, Any], state: dict[str, Any]) -> None:
-    """Recognize observed cart capabilities and reject missing pre-write evidence."""
-    from .execution_journal import lean_guards
-
-    if lean_guards():
-        # F_15 trial: no cart proof protocol; a cart click is an ordinary click and
-        # truthful dispatch recording decides whether its effect is uncertain.
-        entry["cart_mutation"] = False
+    """Attach optional reader context; never require a cart proof protocol for dispatch."""
+    conditions = [c for c in state.get("phase_requirements", []) if c["kind"] == "cart_delta"]
+    available = [c for c in conditions if _has_open_baseline(c)]
+    entry["cart_mutation"] = False
+    if not available:
         return
     cart_steps = []
     cart_context = bool(re.search(r"购物车|加购|\bcart\b", str(state.get("goal", "")), re.I)) or any(
@@ -222,19 +219,11 @@ def prepare_effects(entry: dict[str, Any], state: dict[str, Any]) -> None:
     entry["cart_mutation"] = bool(cart_steps)
     if not cart_steps:
         return
-    conditions = [c for c in state.get("phase_requirements", []) if c["kind"] == "cart_delta"]
-    available = [c for c in conditions if _has_open_baseline(c)]
-    if not available:
-        raise ValueError(
-            "cart_baseline_required_before_write: use browser_phase with a cart_delta reader on the cart page "
-            "before adding/changing quantities. Use {op:verify,inspect_cart:true} for fixed read-only selector hints. "
-            "Search/navigation/reads remain available."
-        )
     for step in cart_steps:
         capability = ((step.get("control") or {}).get("decision_state") or {}).get("effect") or {}
         identities = capability.get("identities") or {}
         if identities and not any(identities.get(c["spec"]["sku_attribute"]) in c["spec"]["deltas"] for c in available):
-            raise ValueError("cart_target_sku_not_in_requested_deltas: reobserve requested SKU/variant before dispatch")
+            raise ValueError("cart_target_sku_not_in_requested_deltas: observed target conflicts with the bound reader")
     entry["effect_skus"] = {}
     for condition in available:
         identities = [(((s.get("control") or {}).get("decision_state") or {}).get("effect") or {}).get("identities")
@@ -261,60 +250,11 @@ def record_effects(state: dict[str, Any], call_id: str) -> None:
     ]
     if not affected:
         return
+    if not any(c["kind"] == "cart_delta" for c in state.get("phase_requirements", [])):
+        return
     state["cart_baseline_closed"] = True
     for item in state.get("phase_requirements", []):
         if item["kind"] == "cart_delta":
             item["status"] = "unknown"
     if any(s.get("effect_domain") == "cart" for s in affected):
         state["cart_write_seen"] = True
-        entry["requires_verification"] = True
-    elif any(s.get("op") in {"evaluate", "run_code"} for s in affected) and (
-        re.search(r"购物车|加购|\bcart\b", str(state.get("goal", "")), re.I)
-        or any(c["kind"] == "cart_delta" for c in state.get("phase_requirements", []))
-    ):
-        # A script acknowledgement is not proof of what business objects it
-        # changed. Fixed readers remain available; do not repeat a possible add.
-        entry["requires_verification"] = True
-
-
-async def observe_cart(runtime: Any, state: dict[str, Any], observation: dict[str, Any]) -> None:
-    """One bounded targeted read per fresh capture when a cart effect needs proof."""
-    from .phase_contract import unresolved_writes
-
-    capture = observation.get("capture_id")
-    pending_ids = set()
-    for entry in unresolved_writes(state):
-        if entry.get("cart_mutation"):
-            pending_ids.update(entry.get("effect_condition_ids", []))
-    if not capture or not pending_ids:
-        return
-    deadline = float(state.get("deadline_at") or time.time())
-    read_deadline = time.monotonic() + min(5, float(state.get("invocation_remaining_s", 5)))
-    for item in state.get("phase_requirements", []):
-        if item["id"] not in pending_ids or item["kind"] != "cart_delta" or item.get("auto_capture") == capture:
-            continue
-        remaining = min(read_deadline - time.monotonic(), deadline - time.time())
-        if remaining <= 0:
-            return
-        item["auto_capture"] = capture
-        import asyncio
-
-        started = time.perf_counter()
-        try:
-            async with asyncio.timeout(remaining):
-                await read_cart(runtime, item, state, baseline=False)
-        except Exception as exc:
-            item.update(status="unknown", reason=f"cart_verification_unavailable:{type(exc).__name__}")
-        finally:
-            browser_agent_log_info(
-                "[BROWSER_TIMING] %s",
-                json.dumps(
-                    {
-                        "component": "cart_verification",
-                        "task_id": state.get("task_id"),
-                        "condition_id": item["id"],
-                        "status": item["status"],
-                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
-                    }
-                ),
-            )

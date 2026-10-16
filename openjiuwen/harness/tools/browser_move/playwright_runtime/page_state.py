@@ -252,6 +252,7 @@ class BrowserPageState:
         self.observed_selected_filters: Any = None
         self.observation_metadata: Dict[str, Any] = {}
         self.read_observation: Dict[str, Any] = {}
+        self.card_probe_cache: Dict[str, Any] = {}
         self.cards_observed_revision = -1
         self.listing_stale = False
 
@@ -266,6 +267,7 @@ class BrowserPageState:
         self.observed_selected_filters = None
         self.observation_metadata = {}
         self.read_observation = {}
+        self.card_probe_cache = {}
         self.pending_interaction = False
         self.interaction_revision += 1
         self.url = str(url or "").strip()
@@ -755,12 +757,15 @@ class BrowserPageState:
         """
         self.interaction_revision += 1
         self.pending_interaction = True
-        self.read_observation = {}
+        # Keep content for before/after comparison; its revision no longer permits
+        # presenting it as a fresh observation. A repeat read is not new progress.
+        self.card_probe_cache = {}
         self.listing_stale = True
 
     def invalidate_listing(self, *, advance_revision: bool = True) -> None:
         """Retire list identities; action acknowledgement must not advance twice."""
         self._cards.clear()
+        self.card_probe_cache = {}
         if advance_revision:
             self.interaction_revision += 1
         self.listing_stale = True

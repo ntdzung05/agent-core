@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import re
 import time
 from contextlib import contextmanager
@@ -262,19 +261,28 @@ def _log(state: dict[str, Any], entry: dict[str, Any]) -> None:
     )
 
 
-def lean_guards() -> bool:
-    """F_15 trial switch: OPENJIUWEN_BROWSER_GUARDS=lean. Anything else keeps today's strict guards."""
-    return os.getenv("OPENJIUWEN_BROWSER_GUARDS", "").strip().lower() == "lean"
-
-
 def _never_performed(error: Any) -> bool:
     """Playwright timed out while still waiting (e.g. for a visible, enabled, stable element).
 
     Its call log says "performing <action>" only once the action is actually sent to the page; an
     error without a call log proves nothing and stays uncertain.
     """
-    text = str(error or "")
-    return "Timeout" in text and "waiting for" in text and "performing" not in text
+    # Playwright formats its own call-log lines with ANSI SGR on some transports.
+    # Strip formatting before parsing entries; never infer dispatch from DOM text.
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(error or ""))
+    header, separator, call_log = text.partition("Call log:")
+    if not separator or not re.search(r"(?:Timeout|TimeoutError).*exceeded", header):
+        return False
+    # Only executor log entries count: DOM/page strings and missing logs prove nothing.
+    lines = [line.strip()[2:].strip().lower() for line in call_log.splitlines()
+             if line.strip().startswith("- ")]
+    if re.search(r"(?im)^\s*(?:-\s*)?(?:\.\.\.|…|\[.*truncated.*\])\s*$", call_log):
+        return False
+    waiting = any(line.startswith("waiting for ") for line in lines)
+    dispatched = any(line.startswith(("performing ", "action was performed", "waiting for scheduled navigations",
+                                     "filling ", "pressing ", "selecting "))
+                     for line in lines)
+    return waiting and not dispatched
 
 
 def _native_preflight_failure(tool: str, result: dict[str, Any]) -> bool:
@@ -318,7 +326,7 @@ def record_result(session: Any, inputs: Any, outcome: dict[str, Any], result: An
         outcome.get("denied")
         or result.get("executed") is False
         or _native_preflight_failure(str(getattr(inputs, "tool_name", "")), result)
-        or lean_guards() and not success
+        or not success and result.get("executed") is not True
         and str(getattr(inputs, "tool_name", "")).endswith(("browser_click", "browser_type", "browser_select_option"))
         and _never_performed(result.get("error") or result.get("result"))
     )
@@ -339,8 +347,12 @@ def record_result(session: Any, inputs: Any, outcome: dict[str, Any], result: An
         elif received is not None:
             ok = received.get("ok") is True
             ran = True if ok else received.get("executed")
-            maybe_ran = not ok and ran is not False
-            if maybe_ran and lean_guards() and _never_performed(received.get("error")):
+            uncertain_execution = not ok and ran is not False and ran is not True
+            if (
+                uncertain_execution
+                and step.get("op") in {"click", "fill", "type", "select_option", "set_checked"}
+                and _never_performed(received.get("error"))
+            ):
                 ran = False  # Timed out before the action was sent: not a write, nothing to reconcile.
             step.update(
                 execution_state="acknowledged"
