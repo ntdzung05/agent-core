@@ -24,6 +24,20 @@ PAGE_OPERATIONS = {
 READ_PAGE_OPERATIONS = {"snapshot", "read_text", "find", "tabs", "wait"}
 
 
+def page_operation_allowed(op: str, allowed) -> bool:
+    """Authorize fixed internal readers independently of arbitrary model-supplied evaluate."""
+    native = PAGE_OPERATIONS.get(op)
+    if native is None:
+        return False
+    if allowed is None or native in allowed:
+        return True
+    fixed_capability = {
+        "read_text": "browser_snapshot", "find": "browser_find",
+        "scroll": "browser_snapshot", "wait": "browser_snapshot",
+    }.get(op)
+    return fixed_capability is not None and fixed_capability in allowed
+
+
 def fixed_text_script(query: str = "") -> str:
     """Parameterize a bounded reader; neither model supplies executable code."""
     return """async (page) => await page.evaluate((query) => {
@@ -87,7 +101,7 @@ class BrowserPageActionTool(Tool):
             if native is None:
                 raise ValueError("unsupported_page_operation")
             allowed = self._runtime.service.allowed_tool_names
-            if allowed is not None and native not in allowed:
+            if not page_operation_allowed(op, allowed):
                 raise ValueError("page_operation_capability_denied")
             extra = {"navigate": {"url"}, "scroll": {"direction"}, "find": {"query"},
                      "select_tab": {"index", "url"}, "hover": {"target_id"}, "wait": {"ms"}}.get(op, set())

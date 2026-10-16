@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.llm.schema.message import (
@@ -36,7 +36,7 @@ from ..playwright_runtime.phase_contract import (
     constrain_actions,
     project_phase,
 )
-from ..playwright_runtime.policy_page_action import PAGE_OPERATIONS, READ_PAGE_OPERATIONS
+from ..playwright_runtime.policy_page_action import PAGE_OPERATIONS, READ_PAGE_OPERATIONS, page_operation_allowed
 from .action_space import build_menu, build_request
 from .config import BrowserDecisionConfig
 from .guard import DecisionGuard, canonical_arguments, validate_binding, validate_guard
@@ -90,6 +90,7 @@ class _Observation:
     error: str = ""
     phase_state: dict[str, Any] = field(default_factory=dict)
     owner: str = ""
+    refresh_llm: Callable[[Any], Awaitable[Any]] | None = None
 
 
 class BrowserPolicyModel(Model):
@@ -277,7 +278,8 @@ class BrowserPolicyModel(Model):
         return self._bind_task(session, phase).fallback_scope != "task"
 
     async def publish_context(
-        self, context: Any, captured: dict[str, Any], *, refresh: bool, observation_only: bool
+        self, context: Any, captured: dict[str, Any], *, refresh: bool, observation_only: bool,
+        refresh_llm: Callable[[Any], Awaitable[Any]] | None = None,
     ) -> dict[str, str]:
         del observation_only  # Observation acquisition belongs to runtime, not to the policy.
         session = context.get_session_ref() if context is not None else None
@@ -437,6 +439,7 @@ class BrowserPolicyModel(Model):
             copy.deepcopy({k: phase[k] for k in ("active_phase_contract", "phase_requirements", "execution_journal")
                            if k in phase}),
             self._owner(session, phase),
+            refresh_llm,
         )
         observed_state = self._fingerprint(self._observations[token], effect=True)
         task.pending["observation_state"] = observed_state
@@ -962,7 +965,7 @@ class BrowserPolicyModel(Model):
         service = getattr(self.runtime, "service", None)
         allowed = getattr(service, "allowed_tool_names", None)
         allowed = set(CORE_BROWSER_TOOL_NAMES if allowed is None else allowed)
-        return {op for op, native in PAGE_OPERATIONS.items() if native in allowed}
+        return {op for op in PAGE_OPERATIONS if page_operation_allowed(op, allowed)}
 
     @staticmethod
     def _action_key(step: dict[str, Any], control: dict[str, Any], observation: _Observation) -> str:
@@ -1223,9 +1226,13 @@ class BrowserPolicyModel(Model):
                     self._count(task, "llm_search_bindings")
 
     async def invoke(self, messages: Any, *, tools: Any = None, **kwargs: Any) -> AssistantMessage:
+        refresh_llm = self._llm_refresh(messages)
         decision, diagnostic, deadline = await self._choose(messages, tools)
         if decision is not None:
             return decision
+        if refresh_llm is not None:
+            async with asyncio.timeout(self._remaining(deadline)):
+                messages = await refresh_llm(messages)
         remaining = self._remaining(deadline)
         wait_limit = self._llm_wait_limit(remaining)
         llm_messages = self._llm_messages(messages, diagnostic)
@@ -1253,10 +1260,14 @@ class BrowserPolicyModel(Model):
         return result.model_copy(update={"metadata": {**result.metadata, "browser_policy": public}})
 
     async def stream(self, messages: Any, *, tools: Any = None, **kwargs: Any):
+        refresh_llm = self._llm_refresh(messages)
         decision, diagnostic, deadline = await self._choose(messages, tools)
         if decision is not None:
             yield AssistantMessageChunk(**decision.model_dump())
             return
+        if refresh_llm is not None:
+            async with asyncio.timeout(self._remaining(deadline)):
+                messages = await refresh_llm(messages)
         first = True
         llm_elapsed_ms = 0.0
         call_deadline = time.monotonic() + self._llm_wait_limit(self._remaining(deadline))
@@ -1302,6 +1313,17 @@ class BrowserPolicyModel(Model):
             self._log_timing("llm", diagnostic, llm_elapsed_ms)
             if callable(getattr(stream, "aclose", None)):
                 await stream.aclose()
+
+    def _llm_refresh(self, messages):
+        if self.decision_config.mode != "hybrid":
+            return None
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                token = (getattr(message, "metadata", {}) or {}).get(CONTEXT_KEY)
+                observation = self._observations.get(token)
+                if observation is not None:
+                    return observation.refresh_llm
+        return None
 
     @staticmethod
     def _llm_wait_limit(remaining: float | None) -> float:
